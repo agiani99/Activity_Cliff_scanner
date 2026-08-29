@@ -29,14 +29,14 @@ An activity cliff is a pair of molecules that are **structurally very similar** 
 |---|---|---|
 | Tanimoto similarity (ECFP4, r=2, 2048 bits) | ≥ 0.95 | Single-atom changes typically give 0.95–0.99 |
 | \|ΔpXC50\| | ≥ 2.0 log units | 100-fold potency difference |
-| No structural–activity intermediate | required | No third compound bridges the gap (optional) |
+| No structural–activity intermediate | optional | No third compound bridges the gap |
 | Assay confidence score | ≥ 8 | Direct assay evidence on single protein |
 
 ### Cliff types
 
 | Type | Active | Inactive | Comparability |
 |---|---|---|---|
-| `XC50` | pXC50 from dose-response assay | pXC50 from same assay | Highest — identical conditions |
+| `XC50` | pXC50 from dose-response assay | pXC50 from **same assay** | Highest — identical conditions |
 | `pct_fallback` | pXC50 ≥ 5.0 (≤ 10 µM) | % inhibition < 50 % at ~10 µM | Lower — cross-assay |
 
 ---
@@ -74,10 +74,22 @@ tqdm
 pip install rdkit pandas numpy requests tqdm
 ```
 
-**Recommended**: download the ChEMBL 37 SQLite database (~5 GB uncompressed) for fastest, network-free operation:
+**Strongly recommended**: download the ChEMBL 37 SQLite database (~5 GB uncompressed) for fastest, network-free operation:
 
 ```
 https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/
+```
+
+**Optional but highly recommended**: download SIFTS flat files for offline protein family classification and PDB structure annotation (see [cliff_enrich.py](#script-2--cliff_enrichpy)):
+
+```bash
+# Download to a local .\MAPS\ folder
+cd MAPS
+curl -O https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/uniprot_pdb.csv.gz
+curl -O https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/pdb_chain_enzyme.csv.gz
+curl -O https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/pdb_chain_pfam.csv.gz
+curl -O https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/pdb_chain_uniprot.csv.gz
+gzip -d *.gz
 ```
 
 ---
@@ -143,10 +155,18 @@ python activity_cliff_scanner.py --demo
 | `--tanimoto FLOAT` | `0.95` | ECFP4 Tanimoto cutoff |
 | `--delta-pxic50 FLOAT` | `2.0` | Minimum \|ΔpXC50\| in log units |
 | `--no-intermediate-check` | off | Skip Criterion 3 (faster, more pairs) |
-| `--xc50-only` | off | Only XC50–XC50 same-assay pairs; disables pct_fallback |
+| `--xc50-only` | off | Only XC50–XC50 same-assay pairs; disables pct_fallback entirely |
 | `--same-assay-type` | off | pct_fallback only between matching assay types (B↔B, F↔F) |
 | `--max-records INT` | 0 (unlimited) | Cap rows fetched from SQLite or API |
 | `--resume` | off | Restart from checkpoint; appends to existing CSV |
+
+### Assay-type strictness hierarchy
+
+| Flag | Filter applied | Expected pairs |
+|---|---|---|
+| *(none)* | None — any cross-assay pair | Most (268 K+ in full proteome run) |
+| `--same-assay-type` | B↔B or F↔F only | Subset — removes cross-biology pairs |
+| `--xc50-only` | Same assay, XC50 only | Fewest — highest confidence |
 
 ### Measurement types included
 
@@ -176,8 +196,6 @@ Use `--resume` to skip already-processed assays on restart. Nothing is lost if t
 
 ### Assay confidence scores
 
-ChEMBL confidence scores for target assignment:
-
 | Score | Meaning |
 |---|---|
 | 9 | Direct assay, single protein, exact compound tested |
@@ -188,28 +206,40 @@ ChEMBL confidence scores for target assignment:
 
 ## Script 2 — `cliff_enrich.py`
 
-Post-hoc enrichment of the scanner output. Adds four annotation layers without re-running the scanner.
+Post-hoc enrichment of the scanner output. Adds seven annotation layers without re-running the scanner.
 
 ### What it adds
 
-| Column | Source | Network needed |
+| Column(s) | Source | Network |
 |---|---|---|
-| `tanimoto_ecfp4` | RDKit ECFP4 from SMILES | No |
-| `active_assay_chembl_id` | Renamed from `assay_chembl_id` | No |
+| `tanimoto_ecfp4` | RDKit ECFP4 from SMILES | None |
+| `active_assay_chembl_id` | Renamed from `assay_chembl_id` | None |
 | `inactive_assay_chembl_id` | Same as active (XC50–XC50); SQLite lookup for pct_fallback | SQLite only |
-| `protein_class_l1/l2/l3` | ChEMBL `protein_class` table | SQLite preferred |
-| `protein_family` | ChEMBL hierarchy + UniProt SIMILARITY comment | UniProt REST fallback |
+| `protein_class_l1/l2/l3`, `protein_family` | **SIFTS EC + Pfam** (primary, offline) → SQLite → ChEMBL REST | SIFTS preferred |
+| `n_target_pdb_structures` | SIFTS UniProt→PDB count | None |
+| `target_pdb_sample` | First 5 PDB IDs for target | None |
+| `active_compound_pdb` | RCSB combined chemical + UniProt search | RCSB REST |
+| `active_pdb_resolution_A` | Resolution of co-crystal structure | RCSB REST |
+| `active_pdb_method` | X-RAY / ELECTRON MICROSCOPY / NMR | RCSB REST |
 
 ### Usage
 
 ```bash
-# Full enrichment with SQLite (recommended)
+# Full enrichment — SIFTS classification + SQLite + PDB annotation (recommended)
 python cliff_enrich.py \
     --input all_cliffs.csv \
     --sqlite "C:/path/to/chembl_37_sqlite" \
+    --maps-dir ".\MAPS" \
     --output all_cliffs_enriched.csv
 
-# Tanimoto only, no network
+# SIFTS offline only — no network, no SQLite (Tanimoto + protein class + PDB counts)
+python cliff_enrich.py \
+    --input all_cliffs.csv \
+    --maps-dir ".\MAPS" \
+    --no-compound-pdb \
+    --output all_cliffs_enriched.csv
+
+# Tanimoto + assay IDs only (fastest, no classification)
 python cliff_enrich.py \
     --input all_cliffs.csv \
     --skip-protein-class \
@@ -220,26 +250,81 @@ python cliff_enrich.py \
 
 | Flag | Default | Description |
 |---|---|---|
-| `--input FILE` | required | Input cliff CSV |
+| `--input FILE` | required | Input cliff CSV from scanner |
 | `--output FILE` | `<input>_enriched.csv` | Output CSV |
-| `--sqlite PATH` | — | ChEMBL SQLite for protein class + inactive assay IDs |
-| `--skip-protein-class` | off | Skip protein class lookup (Steps 3–4) |
-| `--skip-uniprot-family` | off | Skip UniProt SIMILARITY comment lookup |
+| `--sqlite PATH` | — | ChEMBL SQLite for inactive assay IDs and protein class fallback |
+| `--maps-dir DIR` | — | Directory with SIFTS flat files (see below) |
+| `--sifts FILE` | — | Single SIFTS file for PDB structure counts only (superseded by `--maps-dir`) |
+| `--skip-protein-class` | off | Skip all protein class annotation |
+| `--skip-uniprot-family` | off | Skip UniProt SIMILARITY REST fallback |
+| `--no-compound-pdb` | off | Skip per-compound RCSB search (faster; still annotates target PDB counts) |
 
-### Protein class fallback strategy
+### Protein class annotation — priority order
 
-1. `protein_class` table (full L1→L3 hierarchy) — present in most ChEMBL 37 SQLite builds  
-2. `target_class` table (denormalized view) — some builds  
-3. `target_dictionary.target_type` (broad: SINGLE PROTEIN, GPCR…) + UniProt REST for `protein_family`
+```
+1. SIFTS offline (--maps-dir)          pdb_chain_enzyme.csv  → EC number  → Kinase / Protease / PDE
+                                        pdb_chain_pfam.csv    → Pfam domain → GPCR / NHR / Ion channel
+   Coverage: >90% for drug targets. Fully offline. Seconds.
+
+2. ChEMBL SQLite  protein_class table  Two-step: target → protein_class_id → L1/L2/L3
+   Coverage: depends on SQLite build; may be absent.
+
+3. ChEMBL REST    /protein_class/{id}  Two API calls per unique class ID (cached).
+   Coverage: good but slow (~1 s per target).
+
+4. UniProt REST   SIMILARITY comment   "Belongs to the protein kinase superfamily."
+   Only for targets still unresolved after steps 1–3.
+```
+
+### SIFTS files used by `--maps-dir`
+
+Auto-discovered inside the directory by filename. Plain `.csv` and `.gz` both accepted.
+
+| File | Used for |
+|---|---|
+| `uniprot_pdb.csv` or `pdb_chain_uniprot.csv` | UniProt → PDB ID list (target PDB counts, RCSB search filtering) |
+| `pdb_chain_enzyme.csv` | EC numbers → Kinase / Protease / PDE / Phosphatase / ... |
+| `pdb_chain_pfam.csv` | Pfam domains → GPCR / Nuclear hormone receptor / Ion channel / ... |
+
+Download all from: `https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/`
+
+### EC number → protein class mapping (selected)
+
+| EC prefix | L2 label |
+|---|---|
+| 2.7.10.1 | Receptor Tyrosine Kinase |
+| 2.7.11.1 | Serine/Threonine Kinase |
+| 2.7.12 | Dual-specificity Kinase |
+| 3.4.21 | Serine Protease |
+| 3.4.24 | Metalloprotease |
+| 3.1.4.17 | Cyclic Nucleotide PDE |
+| 3.1.3.48 | Tyrosine Phosphatase |
+| 3.5.1.98 | HDAC |
+| 1.14.13/14 | Cytochrome P450 |
+| 3.6.5 | GTPase |
+
+### Pfam → protein class mapping (selected)
+
+| Pfam ID | L2 label |
+|---|---|
+| PF00069, PF07714 | Kinase |
+| PF00001/2/3 | GPCR (family A/B/C) |
+| PF00104, PF00105 | Nuclear Hormone Receptor |
+| PF00520 | Ion Channel |
+| PF00089, PF00026 | Protease |
+| PF00233 | Phosphodiesterase |
+| PF02132 | HDAC |
+| PF00439, PF00628 | Bromodomain |
 
 ### Performance on 268 K rows
 
-| Step | Time |
-|---|---|
-| Tanimoto (vectorised, unique-SMILES cache) | ~60–120 s |
-| Protein class from SQLite | < 5 s (one batch query) |
-| UniProt family (per unique accession, cached) | ~1 s/ID |
-| Inactive assay IDs from SQLite | < 30 s |
+| Step | Source | Time |
+|---|---|---|
+| Tanimoto (vectorised unique-SMILES cache) | RDKit | ~60–120 s |
+| Protein class via SIFTS EC + Pfam | Local files | ~30–60 s |
+| Target PDB counts from SIFTS | Local files | ~5 s |
+| Inactive assay IDs | SQLite | ~30 s |
+| Active compound in PDB (RCSB search) | Network | ~1 s per unique pair |
 
 ---
 
@@ -250,8 +335,9 @@ Generates a **self-contained HTML dashboard** from the cliff CSV. No server requ
 ### Features
 
 - Side-by-side 2D depictions with **MCS scaffold** (pale blue) and **diff atoms** highlighted (green = active-unique, red = inactive-unique)
-- 2D layouts are **aligned on the MCS scaffold** — both images are drawn in the same orientation for direct visual comparison
-- **RMSD** from lowest-energy MMFF conformer alignment on scaffold atoms
+- 2D layouts **aligned on MCS scaffold** — both images drawn in the same orientation
+- **RMSD** from lowest-energy MMFF conformer alignment on scaffold atoms (ETKDGv3)
+- MCS found via two-pass strategy: strict ring matching first, then ring-size-relaxed fallback (catches cyclohexyl→cyclopentyl cliffs); timed-out partial results accepted
 - Sortable / filterable DataTable (Bootstrap 5 + DataTables)
 - Click any row → full-size modal with detail view
 - Self-contained HTML (no local server needed)
@@ -259,26 +345,26 @@ Generates a **self-contained HTML dashboard** from the cliff CSV. No server requ
 ### Usage
 
 ```bash
-# Top 200 pairs, with 3D RMSD (~2 min)
+# Top 200 pairs with 3D RMSD (~2 min)
 python cliff_dashboard.py \
-    --input all_cliffs.csv \
+    --input all_cliffs_enriched.csv \
     --output dashboard.html
 
 # Top 500, skip 3D (faster)
 python cliff_dashboard.py \
-    --input all_cliffs.csv \
+    --input all_cliffs_enriched.csv \
     --top-n 500 --skip-3d \
     --output dashboard.html
 
-# Single target, all pairs, no 3D
+# Single target, all pairs
 python cliff_dashboard.py \
-    --input all_cliffs.csv \
-    --target CHEMBL279 --top-n 0 --skip-3d \
+    --input all_cliffs_enriched.csv \
+    --target CHEMBL279 --top-n 0 \
     --output EGFR_dashboard.html
 
 # XC50-only pairs with 3D RMSD
 python cliff_dashboard.py \
-    --input all_cliffs.csv \
+    --input all_cliffs_enriched.csv \
     --cliff-type XC50 --top-n 200 \
     --output dashboard_xc50.html
 ```
@@ -290,7 +376,7 @@ python cliff_dashboard.py \
 | `--input FILE` | required | Cliff CSV (scanner or enricher output) |
 | `--output FILE` | `<input>_dashboard.html` | Output HTML |
 | `--top-n INT` | 200 | Pairs to render (0 = all; >500 makes large files) |
-| `--min-delta FLOAT` | 2.0 | Minimum \|ΔpXC50\| (NaN-delta pct_fallback pairs are kept) |
+| `--min-delta FLOAT` | 2.0 | Minimum \|ΔpXC50\|; NaN-delta pct_fallback pairs are always kept |
 | `--target CHEMBL_ID` | all | Filter to one target |
 | `--cliff-type` | `all` | `XC50`, `pct_fallback`, or `all` |
 | `--skip-3d` | off | Skip ETKDGv3 + MMFF conformer generation and RMSD |
@@ -299,7 +385,7 @@ python cliff_dashboard.py \
 
 | RMSD (Å) | Interpretation |
 |---|---|
-| < 0.5 | Scaffold is rigid; cliff is likely **electronic** (changed atom alters charge, H-bond, polarisability) |
+| < 0.5 | Scaffold rigid; cliff is likely **electronic** (changed atom alters charge, H-bond, polarisability) |
 | 0.5–1.5 | Mixed — electronic + minor conformational perturbation |
 | > 1.5 | Structural change **perturbs the preferred conformation** — possible binding-mode change |
 
@@ -308,19 +394,21 @@ python cliff_dashboard.py \
 ## Recommended workflow
 
 ```bash
-# Step 1: scan with assay-type filter
+# Step 1: scan — same assay-type filter (B↔B, F↔F)
 python activity_cliff_scanner.py \
     --sqlite "C:/path/to/chembl_37_sqlite" \
     --same-assay-type \
     --output all_cliffs.csv
 
-# Step 2: enrich
+# Step 2: enrich — SIFTS offline protein class + PDB annotation
 python cliff_enrich.py \
     --input all_cliffs.csv \
     --sqlite "C:/path/to/chembl_37_sqlite" \
+    --maps-dir ".\MAPS" \
+    --no-compound-pdb \
     --output all_cliffs_enriched.csv
 
-# Step 3: dashboard — XC50 pairs, top 200 with RMSD
+# Step 3: dashboard — XC50 pairs, top 200 with 3D RMSD
 python cliff_dashboard.py \
     --input all_cliffs_enriched.csv \
     --cliff-type XC50 \
@@ -346,9 +434,9 @@ python cliff_dashboard.py \
 | `inactive_pXC50` | float | Populated for XC50 pairs; NaN for pct_fallback |
 | `inactive_value_nM` | float | Raw potency in nM; NaN for pct_fallback |
 | `inactive_std_type` | str | Measurement type |
-| `inactive_pct_activity` | float | % inhibition at ~10 µM; populated only for pct_fallback |
+| `inactive_pct_activity` | float | % inhibition at ~10 µM; pct_fallback only |
 | `delta_pXC50` | float | \|active_pXC50 − inactive_pXC50\|; NaN for pct_fallback |
-| `assay_chembl_id` | str | ChEMBL assay ID |
+| `assay_chembl_id` | str | ChEMBL assay ID (renamed to `active_assay_chembl_id` by enricher) |
 | `target_chembl_id` | str | ChEMBL target ID |
 | `target_name` | str | Target preferred name |
 | `target_organism` | str | e.g. Homo sapiens |
@@ -364,15 +452,20 @@ python cliff_dashboard.py \
 
 ### Additional columns after `cliff_enrich.py`
 
-| Column | Notes |
-|---|---|
-| `tanimoto_ecfp4` | ECFP4 Tanimoto similarity (4 d.p.) |
-| `active_assay_chembl_id` | Assay of the active measurement |
-| `inactive_assay_chembl_id` | Assay of the inactive measurement; may differ for pct_fallback |
-| `protein_class_l1` | Broad class: Enzyme, Ion channel, GPCR, Transcription factor… |
-| `protein_class_l2` | e.g. Kinase, Phosphatase, Protease |
-| `protein_class_l3` | e.g. Protein Kinase, Serine Protease |
-| `protein_family` | Full ChEMBL pref_name or UniProt SIMILARITY comment |
+| Column | Source | Notes |
+|---|---|---|
+| `tanimoto_ecfp4` | RDKit | ECFP4 Tanimoto similarity (4 d.p.) |
+| `active_assay_chembl_id` | Renamed | Assay of the active measurement |
+| `inactive_assay_chembl_id` | SQLite / same | Assay of the inactive; differs for pct_fallback |
+| `protein_class_l1` | SIFTS / SQLite / REST | Enzyme, Membrane receptor, Nuclear receptor, Ion channel, Transporter |
+| `protein_class_l2` | SIFTS / SQLite / REST | **Kinase, Protease, GPCR, NHR, Phosphodiesterase, ...** |
+| `protein_class_l3` | SIFTS / SQLite / REST | Serine Protease, Family A GPCR, Cyclic Nucleotide PDE, ... |
+| `protein_family` | SIFTS / REST | Protein Kinase, Metalloprotease, NHR ligand-binding domain, ... |
+| `n_target_pdb_structures` | SIFTS | Count of PDB entries for target UniProt accession |
+| `target_pdb_sample` | SIFTS | Comma-separated list of first 5 PDB IDs |
+| `active_compound_pdb` | RCSB REST | PDB ID where exact active compound is co-crystallised with target |
+| `active_pdb_resolution_A` | RCSB REST | Resolution (Å) of co-crystal structure |
+| `active_pdb_method` | RCSB REST | X-RAY DIFFRACTION / ELECTRON MICROSCOPY / SOLUTION NMR |
 
 ---
 
@@ -380,7 +473,7 @@ python cliff_dashboard.py \
 
 ### Why Tanimoto ≥ 0.95?
 
-At this threshold, pairs typically differ by a **single atom or small functional group** (F→Cl, H→CH₃, CH₂ insertion, ring-size change). This makes structural differences unambiguous and directly interpretable. Lowering to 0.85 admits scaffold hops where the activity difference may not be attributable to one specific change.
+At this threshold, pairs typically differ by a **single atom or small functional group** (F→Cl, H→CH₃, CH₂ insertion, ring-size change). This makes structural differences unambiguous and directly interpretable. Lowering to 0.85 admits scaffold hops where the activity difference may not be attributable to one specific structural change.
 
 ### Why confidence score ≥ 8?
 
@@ -399,18 +492,20 @@ Comparing a Ki (B) with a cellular IC50 (F) conflates target-binding affinity wi
 
 ### pct_fallback pairs
 
-These pairs have a quantified pXC50 for the active compound but only a single-point % inhibition measurement for the inactive. They are useful for:
-- Identifying active compounds with clear structural neighbours that failed to show any activity at 10 µM
-- High-throughput enumeration of potential cliffs from HTS data
-
-They are scientifically weaker than XC50–XC50 pairs because the "inactivity" may reflect insufficient dose rather than true structural failure. Use `--xc50-only` for high-confidence SAR analysis.
+These pairs have a quantified pXC50 for the active compound but only a single-point % inhibition measurement for the inactive. They are useful for identifying active compounds with clear structural neighbours that failed to show any activity at 10 µM. They are scientifically weaker than XC50–XC50 pairs because the "inactivity" may reflect insufficient dose rather than true structural failure. Use `--xc50-only` for high-confidence SAR analysis.
 
 ### Salt and duplicate handling
 
 Before fingerprint computation, molecules are deduplicated per assay using three passes:
 
 1. Same `molecule_chembl_id` + assay → keep most potent
-2. Same raw InChIKey + assay → keep most potent  
+2. Same raw InChIKey + assay → keep most potent
 3. Same **parent** InChIKey (largest fragment + neutralised) + assay → keep most potent
 
 This collapses free-base / hydrochloride / sodium salt forms of the same compound to a single entry, preventing spurious "cliffs" from salt differences.
+
+### SIFTS-based protein classification
+
+EC numbers from `pdb_chain_enzyme.csv` are the primary protein class source because they are assigned experimentally and encode enzyme function precisely. Pfam domain IDs from `pdb_chain_pfam.csv` supplement for non-enzymes (GPCRs, nuclear receptors, ion channels) which have no EC number by definition. The combination gives >90% coverage for drug targets in ChEMBL.
+
+The `active_compound_pdb` RCSB search uses a combined filter: chemical (InChIKey exact match) AND protein entity (UniProt accession). This prevents false positives where the same ligand is found in a different protein target.
