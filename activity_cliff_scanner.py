@@ -636,6 +636,179 @@ def fetch_target_metadata(target_ids: list) -> dict:
 # DATA PREPROCESSING
 # ?????????????????????????????????????????????????????????????????????????????
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EXTERNAL CSV LOADER  (non-ChEMBL data with SMILES + pChEMBL value)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Column name candidates tried in priority order for auto-detection
+_SMILES_CANDIDATES   = ["smiles", "canonical_smiles", "structure", "mol",
+                         "molecule", "smi", "Smiles", "SMILES"]
+_ACTIVITY_CANDIDATES = ["pchembl_value", "pxc50", "pic50", "pki", "pkd",
+                         "pec50", "pac50", "pactivity", "p_activity",
+                         "activity", "potency", "value", "p_value"]
+_ID_CANDIDATES       = ["id", "compound_id", "molecule_id", "chembl_id",
+                         "name", "compound_name", "mol_id", "cmpd_id",
+                         "molregno", "reg_id"]
+_ASSAY_CANDIDATES    = ["assay_id", "assay", "assay_chembl_id", "group",
+                         "series", "project", "batch", "dataset"]
+_TARGET_CANDIDATES   = ["target_id", "target_chembl_id", "target", "protein",
+                         "gene", "receptor"]
+
+
+def _detect_col(df: pd.DataFrame, candidates: list, explicit: Optional[str]) -> Optional[str]:
+    """Return `explicit` if given; otherwise the first candidate found in df.columns."""
+    if explicit:
+        if explicit in df.columns:
+            return explicit
+        raise ValueError(
+            f"Column '{explicit}' not found. Available: {list(df.columns)}"
+        )
+    cols_lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols_lower:
+            return cols_lower[cand.lower()]
+    return None
+
+
+def load_external_csv(
+    path: str,
+    smiles_col:   Optional[str] = None,
+    activity_col: Optional[str] = None,
+    id_col:       Optional[str] = None,
+    assay_col:    Optional[str] = None,
+    target_col:   Optional[str] = None,
+    default_assay:  str = "EXTERNAL_ASSAY",
+    default_target: str = "EXTERNAL_TARGET",
+    default_type:   str = "IC50",
+) -> pd.DataFrame:
+    """
+    Load an external CSV containing SMILES and pChEMBL values and translate it
+    into the internal dataframe format expected by preprocess_xc50().
+
+    Column detection
+    ----------------
+    Column names are auto-detected from common synonyms.  Use the explicit
+    override flags (--smiles-col, --activity-col, etc.) when auto-detection
+    picks the wrong column.
+
+    Required
+    --------
+    smiles_col    SMILES string for each compound.
+    activity_col  pChEMBL value = -log10(IC50/EC50/Ki/Kd in M).
+                  Values must be in pChEMBL units (typically 5-12).
+                  NOT nanomolar concentrations — those go through --input-csv.
+
+    Optional
+    --------
+    id_col        Compound identifier.  Auto-generated (EXT_00001 ...) if absent.
+    assay_col     Grouping column; compounds in different groups are not paired.
+                  If absent, all compounds are treated as one virtual assay.
+    target_col    Target identifier (propagated to output for filtering).
+
+    Internal mapping
+    ----------------
+    The function back-converts pChEMBL to nM for standard_value so the existing
+    preprocess_xc50() pipeline works unchanged:
+        standard_value (nM) = 10^(9 - pchembl_value)
+    """
+    logger.info(f"Loading external CSV: {path}")
+    df = pd.read_csv(path, low_memory=False)
+    logger.info(f"  {len(df):,} rows, {len(df.columns)} columns: {list(df.columns)}")
+
+    # ── Detect columns ────────────────────────────────────────────────────
+    smi_c  = _detect_col(df, _SMILES_CANDIDATES,   smiles_col)
+    act_c  = _detect_col(df, _ACTIVITY_CANDIDATES, activity_col)
+    id_c   = _detect_col(df, _ID_CANDIDATES,       id_col)
+    assay_c= _detect_col(df, _ASSAY_CANDIDATES,    assay_col)
+    tgt_c  = _detect_col(df, _TARGET_CANDIDATES,   target_col)
+
+    if smi_c is None:
+        raise ValueError(
+            f"Cannot detect a SMILES column in {list(df.columns)}.\n"
+            f"Use --smiles-col to specify it explicitly."
+        )
+    if act_c is None:
+        raise ValueError(
+            f"Cannot detect a pChEMBL activity column in {list(df.columns)}.\n"
+            f"Use --activity-col to specify it.\n"
+            f"The column must contain pChEMBL values (-log10 molar), "
+            f"NOT raw IC50 concentrations."
+        )
+
+    _assay_label  = assay_c  or f"(single virtual assay: {default_assay})"
+    _target_label = tgt_c    or f"(default: {default_target})"
+    logger.info(f"  SMILES      : '{smi_c}'")
+    logger.info(f"  pChEMBL     : '{act_c}'")
+    logger.info(f"  Compound ID : '{id_c or '(auto-generated)'}'")
+    logger.info(f"  Assay group : '{_assay_label}'")
+    logger.info(f"  Target      : '{_target_label}'")
+    # ── Build internal dataframe ──────────────────────────────────────────
+    out = pd.DataFrame()
+    out["canonical_smiles"] = df[smi_c].astype(str).str.strip()
+
+    # pChEMBL value
+    out["pchembl_value"] = pd.to_numeric(df[act_c], errors="coerce")
+    invalid = out["pchembl_value"].isna().sum()
+    if invalid:
+        logger.warning(f"  {invalid:,} rows with non-numeric activity dropped")
+
+    # Back-convert pChEMBL → nM so preprocess_xc50() standard_value path works
+    # pChEMBL = -log10(M)  →  M = 10^(-pChEMBL)  →  nM = 10^(9-pChEMBL)
+    out["standard_value"] = 10.0 ** (9.0 - out["pchembl_value"])
+    out["standard_units"] = "nM"
+    out["standard_type"]  = default_type
+
+    # Compound ID
+    if id_c:
+        out["molecule_chembl_id"] = df[id_c].astype(str).str.strip()
+    else:
+        width = len(str(len(df)))
+        out["molecule_chembl_id"] = [f"EXT_{i:0{width}d}" for i in range(len(df))]
+
+    # ── Assay group ───────────────────────────────────────────────────────
+    # Priority:
+    #   1. Explicit --assay-col           → group by that column
+    #   2. No assay col, but target col   → group by target (one "assay" per target)
+    #   3. Neither                        → single virtual assay (all vs all)
+    if assay_c:
+        out["assay_chembl_id"] = df[assay_c].astype(str).str.strip()
+        _grp_src = f"assay column '{assay_c}'"
+    elif tgt_c:
+        out["assay_chembl_id"] = df[tgt_c].astype(str).str.strip()
+        _grp_src = (f"target column '{tgt_c}' (no --assay-col given; "
+                    f"compounds grouped per target — cross-target pairs excluded)")
+    else:
+        out["assay_chembl_id"] = default_assay
+        _grp_src = f"single virtual assay '{default_assay}' (no grouping column)"
+
+    logger.info(f"  Grouping by  : {_grp_src}")
+
+    # Target
+    out["target_chembl_id"] = (
+        df[tgt_c].astype(str).str.strip() if tgt_c else default_target
+    )
+    out["target_name"]     = out["target_chembl_id"]
+    out["target_organism"] = "N/A"
+
+    # Confidence score — external data treated as fully trusted
+    out["assay_confidence_score"] = 9
+
+    # Preserve any extra columns the user may have (for reference in output)
+    extra = [c for c in df.columns
+             if c not in (smi_c, act_c, id_c, assay_c, tgt_c)]
+    for c in extra:
+        if c not in out.columns:
+            out[f"ext_{c}"] = df[c].values
+
+    logger.info(
+        f"  External CSV loaded: {len(out):,} rows, "
+        f"{out['assay_chembl_id'].nunique():,} assay group(s), "
+        f"{out['target_chembl_id'].nunique():,} target(s)"
+    )
+    return out
+
+
 def preprocess_xc50(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1148,12 +1321,36 @@ def parse_args():
     )
     src.add_argument(
         "--input-csv", metavar="CSV",
-        help="Pre-exported CSV with ChEMBL activity columns (skips API/SQLite).",
+        help="Pre-exported ChEMBL activity CSV (skips API/SQLite).",
+    )
+    src.add_argument(
+        "--external-csv", metavar="CSV",
+        help=(
+            "External CSV with SMILES and pChEMBL values (non-ChEMBL data).\n"
+            "Columns are auto-detected; use --smiles-col / --activity-col to override.\n"
+            "The activity column must contain pChEMBL values (-log10 molar, e.g. 8.3),\n"
+            "NOT raw IC50 concentrations in nM."
+        ),
     )
     src.add_argument(
         "--demo", action="store_true",
         help="Run on built-in example data (no network, no SQLite required).",
     )
+    # External CSV column mapping (only relevant when --external-csv is used)
+    p.add_argument("--smiles-col",   metavar="COL", default=None,
+                   help="SMILES column name in --external-csv (auto-detected if omitted).")
+    p.add_argument("--activity-col", metavar="COL", default=None,
+                   help="pChEMBL activity column in --external-csv (auto-detected if omitted).")
+    p.add_argument("--id-col",       metavar="COL", default=None,
+                   help="Compound ID column in --external-csv (auto-generated if omitted).")
+    p.add_argument("--assay-col",    metavar="COL", default=None,
+                   help=(
+                       "Grouping column in --external-csv.  Compounds in different "
+                       "groups are never paired.  If omitted, all compounds are treated "
+                       "as one virtual assay."
+                   ))
+    p.add_argument("--target-col",   metavar="COL", default=None,
+                   help="Target column in --external-csv (propagated to output).")
     p.add_argument("--target", "-t", metavar="CHEMBL_ID",
                    help="Restrict scan to a single ChEMBL target (e.g. CHEMBL279).")
     p.add_argument("--output", "-o", default="activity_cliffs.csv",
@@ -1264,10 +1461,23 @@ def main():
         target_meta = fetch_target_meta_from_sqlite(db_path, unique_targets)
 
     elif args.input_csv:
-        # ?? Pre-exported CSV ??????????????????????????????????????????????
+        # Pre-exported ChEMBL CSV
         logger.info(f"\n[Step 1] Loading from CSV: {args.input_csv}")
         df_raw     = pd.read_csv(args.input_csv, low_memory=False)
         df_pct_raw = pd.DataFrame()
+
+    elif args.external_csv:
+        # External non-ChEMBL data (SMILES + pChEMBL)
+        logger.info(f"\n[Step 1] Loading external CSV: {args.external_csv}")
+        df_raw = load_external_csv(
+            args.external_csv,
+            smiles_col   = args.smiles_col,
+            activity_col = args.activity_col,
+            id_col       = args.id_col,
+            assay_col    = args.assay_col,
+            target_col   = args.target_col,
+        )
+        df_pct_raw = pd.DataFrame()   # no % inhibition fallback for external data
 
     else:
         # ?? ChEMBL REST API ???????????????????????????????????????????????
@@ -1354,7 +1564,7 @@ def main():
         return
 
     # ?? Fetch REST target metadata only if SQLite didn't supply it ????????
-    if not args.sqlite and not args.input_csv:
+    if not args.sqlite and not args.input_csv and not args.external_csv:
         logger.info("\n[Step 4] Fetching target metadata (REST)?")
         unique_targets = df_all["target_chembl_id"].dropna().unique().tolist()
         target_meta = fetch_target_metadata(unique_targets)
