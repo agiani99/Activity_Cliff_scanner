@@ -1,6 +1,8 @@
 # Activity Cliff Scanner
 
 A three-script pipeline for detecting, enriching, and visualising **activity cliffs** in ChEMBL — structurally similar compound pairs with large potency differences — using ECFP4 fingerprints, RDKit, and the ChEMBL 37 SQLite database.
+
+
 Final output is an helpful dashboard ![dashboard](https://github.com/agiani99/Activity_Cliff_scanner/blob/main/Screenshot.png).
 
 ---
@@ -510,3 +512,92 @@ This collapses free-base / hydrochloride / sodium salt forms of the same compoun
 EC numbers from `pdb_chain_enzyme.csv` are the primary protein class source because they are assigned experimentally and encode enzyme function precisely. Pfam domain IDs from `pdb_chain_pfam.csv` supplement for non-enzymes (GPCRs, nuclear receptors, ion channels) which have no EC number by definition. The combination gives >90% coverage for drug targets in ChEMBL.
 
 The `active_compound_pdb` RCSB search uses a combined filter: chemical (InChIKey exact match) AND protein entity (UniProt accession). This prevents false positives where the same ligand is found in a different protein target.
+
+---
+
+## External data — `--external-csv`
+
+Analyse proprietary or non-ChEMBL data without any database access.
+
+### Requirements
+
+| Column | Content | Notes |
+|---|---|---|
+| SMILES | Compound structure | Required |
+| pChEMBL | −log₁₀(IC50/EC50/Ki/Kd in M) | Required — pChEMBL units, NOT raw nM |
+| Compound ID | Molecule name / ID | Optional — auto-generated (`EXT_00001`…) if absent |
+| Target / Assay | Grouping key | Optional but strongly recommended (see below) |
+
+**The activity column must contain pChEMBL values (e.g. 8.3), not raw concentrations in nM.** Raw concentrations should be pre-converted: `pChEMBL = −log₁₀(IC50_M)`.
+
+### Usage
+
+```bash
+# Auto-detect columns (tries common synonyms)
+python activity_cliff_scanner.py \
+    --external-csv my_data.csv \
+    --output my_cliffs.csv
+
+# Explicit column names (override auto-detection)
+python activity_cliff_scanner.py \
+    --external-csv my_data.csv \
+    --smiles-col   "SMILES" \
+    --activity-col "pChEMBL" \
+    --id-col       "MOLECULE NAME" \
+    --target-col   "TARGET NAME" \
+    --output my_cliffs.csv
+
+# With assay-level grouping (finer-grained than target)
+python activity_cliff_scanner.py \
+    --external-csv my_data.csv \
+    --smiles-col   "SMILES" \
+    --activity-col "pIC50" \
+    --id-col       "Cpd_ID" \
+    --assay-col    "Assay_ID" \
+    --target-col   "Gene" \
+    --output my_cliffs.csv
+
+# Combine with any scanner flag
+python activity_cliff_scanner.py \
+    --external-csv my_data.csv \
+    --smiles-col   "SMILES" \
+    --activity-col "pChEMBL" \
+    --id-col       "MOLECULE NAME" \
+    --target-col   "TARGET NAME" \
+    --tanimoto 0.85 --delta-pxic50 1.5 \
+    --xc50-only \
+    --output my_cliffs.csv
+```
+
+### Compound grouping — critical for multi-target datasets
+
+Cliff detection only compares compounds **within the same group**. The grouping key determines which compounds are eligible to form pairs:
+
+| Flags provided | Grouping key | Behaviour |
+|---|---|---|
+| `--assay-col` | Assay column | Pairs within each assay; multiple assays per target allowed |
+| `--target-col` only | **Target column** | Pairs within each target; cross-target pairs excluded |
+| Neither | Single `EXTERNAL_ASSAY` | All compounds compared against all — only correct for single-target datasets |
+
+> **If your CSV contains multiple targets, always provide `--target-col`.**  
+> Without it, all compounds land in one virtual assay and cross-target pairs are incorrectly generated.
+
+### Auto-detected column name synonyms
+
+| Field | Recognised names (case-insensitive) |
+|---|---|
+| SMILES | `smiles`, `canonical_smiles`, `structure`, `mol`, `molecule`, `smi` |
+| pChEMBL | `pchembl_value`, `pxc50`, `pic50`, `pki`, `pkd`, `pec50`, `activity`, `potency`, `value` |
+| Compound ID | `id`, `compound_id`, `molecule_id`, `name`, `compound_name`, `mol_id`, `cmpd_id` |
+| Assay group | `assay_id`, `assay`, `group`, `series`, `project`, `batch`, `dataset` |
+| Target | `target_id`, `target`, `protein`, `gene`, `receptor` |
+
+### What happens internally
+
+- pChEMBL is back-converted to nM (`standard_value = 10^(9 − pChEMBL)`) so the standard preprocessing pipeline works unchanged.
+- All identity filters apply: InChIKey deduplication, parent InChIKey (salt stripping), Tanimoto = 1.0 guard.
+- Extra columns in your CSV are preserved in the output with an `ext_` prefix.
+- Compound IDs are auto-generated as `EXT_00001`, `EXT_00002`… if no ID column is found.
+- Assay confidence score is set to 9 (trusted external data).
+- No ChEMBL lookup is performed — `uniprot_id`, `target_name` etc. are populated from the target column or left as `EXTERNAL_TARGET`.
+
