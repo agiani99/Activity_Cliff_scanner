@@ -1,6 +1,7 @@
 # Activity Cliff Scanner
 
 A three-script pipeline for detecting, enriching, and visualising **activity cliffs** in ChEMBL — structurally similar compound pairs with large potency differences — using ECFP4 fingerprints, RDKit, and the ChEMBL 37 SQLite database.
+Final output (dashboard](Screenshot 2026-08-30 173354.png) can be helpful
 
 ---
 
