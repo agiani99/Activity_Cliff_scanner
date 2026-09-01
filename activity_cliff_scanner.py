@@ -900,21 +900,41 @@ def find_cliffs_xc50(
     tanimoto_thresh: float = TANIMOTO_CUTOFF,
     delta_p: float = DELTA_PXIC50_CUTOFF,
     check_intermediate: bool = True,
+    chain_only: bool = False,
+    best_partner_only: bool = False,
+    min_pxc50: Optional[float] = None,
     output_path: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     resume: bool = False,
 ) -> int:
     """
-    Find activity cliff pairs within each assay.
+    Find activity cliff (or biomimetic) pairs within each assay.
+
+    Pair-reduction modes (address star-topology explosion at low delta_p)
+    ---------------------------------------------------------------------
+    chain_only (--chain-only)
+        Within each assay, compounds are sorted by pXC50 descending.
+        Only *consecutive* pairs in that ranking are considered.
+        Each compound can be active in one pair and inactive in another
+        but never against non-adjacent neighbors.  Eliminates redundant
+        A→B, A→C, A→D "star" topologies.  Best for biomimetic analysis
+        where you want to trace the SAR ladder step by step.
+
+    best_partner_only (--best-partner-only)
+        After all valid pairs are found, each active compound keeps only
+        its single highest-Tanimoto inactive partner.  Less strict than
+        chain_only but still collapses star topologies significantly.
+
+    min_pxc50 (--min-pxc50)
+        Exclude compounds below this pXC50 from the comparison entirely.
+        Useful with low delta_p to avoid pairing two very weak binders.
 
     Performance
     -----------
     Compounds in each assay group are sorted by pXC50 descending.
     np.searchsorted locates the first index j where
     pXC50[i] - pXC50[j] >= delta_p in O(log n) per compound.
-    BulkTanimotoSimilarity is then called ONLY on those candidates,
-    not on the full O(n2) pair set.  For assays where the activity
-    range is < delta_p (the majority), zero Tanimoto calls are made.
+    BulkTanimotoSimilarity is then called ONLY on those candidates.
 
     Resilience
     ----------
@@ -967,7 +987,17 @@ def find_cliffs_xc50(
                     ckpt_fh.write(assay_id + "\n")
                 continue
 
-            # ?? Sort group by pXC50 descending for searchsorted trick ????
+            # Optional min_pxc50 filter
+            if min_pxc50 is not None:
+                mask = grp["pXC50"] >= min_pxc50
+                grp  = grp[mask].reset_index(drop=True)
+                n    = len(grp)
+                if n < 2:
+                    if ckpt_fh:
+                        ckpt_fh.write(assay_id + "\n")
+                    continue
+
+            # Sort group by pXC50 descending for searchsorted trick
             order   = np.argsort(grp["pXC50"].values)[::-1]
             pvals   = grp["pXC50"].values[order].astype(float)
             fps     = [grp["fp"].iloc[k]            for k in order]
@@ -978,14 +1008,14 @@ def find_cliffs_xc50(
 
             for i in range(n):
                 # Binary search: first j where pvals[i] - pvals[j] >= delta_p
-                # i.e., -pvals[j] >= -pvals[i] + delta_p
                 lo = int(np.searchsorted(neg_p, neg_p[i] + delta_p, side="left"))
-                lo = max(lo, i + 1)   # avoid self-pair and double-counting
+                lo = max(lo, i + 1)
                 if lo >= n:
-                    continue           # no j satisfies delta_pXC50 criterion
+                    continue
 
-                # ?? Compute Tanimoto ONLY for delta_pXC50-qualifying js ??
-                cand_range = range(lo, n)
+                # chain_only: only compare i to its immediate pXC50 neighbour
+                # (consecutive-pair SAR ladder — no star topology)
+                cand_range = range(lo, lo + 1) if chain_only else range(lo, n)
                 cand_fps   = [fps[j] for j in cand_range]
                 sims       = bulk_tanimoto(fps[i], cand_fps)
 
@@ -1033,6 +1063,7 @@ def find_cliffs_xc50(
                         "inactive_value_nM":  round(float(ri.get("value_nM", np.nan)), 3),
                         "inactive_std_type":  ri.get("standard_type", ""),
                         "delta_pXC50":        round(float(dp), 4),
+                        "sali":               round(float(dp) / (1.0 - float(sim_ij) + 1e-9), 4),
                         "assay_chembl_id":    assay_id,
                         "target_chembl_id":   ra.get("target_chembl_id", "N/A"),
                         "target_name":        ra.get("target_name", "N/A"),
@@ -1217,7 +1248,7 @@ FINAL_COLS = [
     "active_value_nM", "active_std_type",
     "inactive_chembl_id", "inactive_smiles", "inactive_pXC50",
     "inactive_value_nM", "inactive_std_type", "inactive_pct_activity",
-    "delta_pXC50",
+    "delta_pXC50", "sali",
     "assay_chembl_id", "target_chembl_id", "target_name",
     "target_organism", "uniprot_id", "assay_confidence_score",
     "active_n_tautomers", "active_tautomer_important",
@@ -1226,13 +1257,25 @@ FINAL_COLS = [
     "cliff_type",
 ]
 
-def format_output(df: pd.DataFrame) -> pd.DataFrame:
+def format_output(df: pd.DataFrame,
+                  best_partner_only: bool = False) -> pd.DataFrame:
     # Final safety net: drop any surviving same-molecule pair
     if "active_chembl_id" in df.columns and "inactive_chembl_id" in df.columns:
         same = df["active_chembl_id"] == df["inactive_chembl_id"]
         if same.any():
             logger.warning(f"  Safety filter removed {same.sum()} same-ChEMBL-ID pair(s)")
             df = df[~same]
+
+    # best_partner_only: for each active compound keep only the highest-SALI partner
+    # SALI = delta_pXC50 / (1 - tanimoto) — highest means most informative pair
+    if best_partner_only and "sali" in df.columns and "active_chembl_id" in df.columns:
+        before = len(df)
+        df = (df.sort_values("sali", ascending=False)
+                .drop_duplicates(subset=["active_chembl_id", "assay_chembl_id"],
+                                 keep="first"))
+        logger.info(f"  --best-partner-only: {before:,} → {len(df):,} pairs "
+                    f"(kept highest-SALI partner per active compound per assay)")
+
     cols = [c for c in FINAL_COLS if c in df.columns]
     out = df[cols].copy().sort_values("delta_pXC50", ascending=False, na_position="last")
     return out.reset_index(drop=True)
@@ -1361,6 +1404,24 @@ def parse_args():
                    help=f"|?pXC50| cutoff (default {DELTA_PXIC50_CUTOFF}).")
     p.add_argument("--no-intermediate-check", action="store_true",
                    help="Skip Criterion 3 (faster, returns more pairs).")
+    p.add_argument("--chain-only", action="store_true",
+                   help=(
+                       "Biomimetics / low-delta mode: only report CONSECUTIVE pairs in "
+                       "pXC50-sorted order within each assay. Eliminates star-topology "
+                       "redundancy. Recommended with --delta-pxic50 < 1.5."
+                   ))
+    p.add_argument("--best-partner-only", action="store_true",
+                   help=(
+                       "Keep only the highest-SALI inactive partner per active compound "
+                       "per assay. Less strict than --chain-only. "
+                       "SALI = delta_pXC50 / (1 - Tanimoto)."
+                   ))
+    p.add_argument("--min-pxc50", type=float, default=None,
+                   help=(
+                       "Exclude compounds weaker than this pXC50 from cliff comparison "
+                       "(e.g. --min-pxc50 5.0 drops IC50 > 10 uM compounds). "
+                       "Useful with low --delta-pxic50 to avoid pairing two very weak binders."
+                   ))
     p.add_argument("--max-records", type=int, default=0,
                    help="Cap total rows fetched (0 = unlimited). Useful for first tests.")
     p.add_argument("--resume", action="store_true",
@@ -1517,6 +1578,9 @@ def main():
         tanimoto_thresh=args.tanimoto,
         delta_p=args.delta_pxic50,
         check_intermediate=(not args.no_intermediate_check),
+        chain_only=args.chain_only,
+        best_partner_only=False,     # applied in format_output instead
+        min_pxc50=args.min_pxc50,
         output_path=checkpoint_path.replace(".ckpt", "_raw.csv"),
         checkpoint_path=checkpoint_path,
         resume=args.resume,
@@ -1575,7 +1639,7 @@ def main():
 
     # ?? Export ????????????????????????????????????????????????????????????
     logger.info("\n[Step 6] Writing output?")
-    df_final = format_output(df_enriched)
+    df_final = format_output(df_enriched, best_partner_only=args.best_partner_only)
     df_final.to_csv(args.output, index=False, float_format="%.4f")
     print_summary(df_final, args.output)
 
