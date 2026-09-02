@@ -2,7 +2,6 @@
 
 A three-script pipeline for detecting, enriching, and visualising **activity cliffs** in ChEMBL — structurally similar compound pairs with large potency differences — using ECFP4 fingerprints, RDKit, and the ChEMBL 37 SQLite database.
 
-
 Final output is an helpful dashboard ![dashboard](https://github.com/agiani99/Activity_Cliff_scanner/blob/main/Screenshot.png).
 
 ---
@@ -162,6 +161,12 @@ python activity_cliff_scanner.py --demo
 | `--same-assay-type` | off | pct_fallback only between matching assay types (B↔B, F↔F) |
 | `--max-records INT` | 0 (unlimited) | Cap rows fetched from SQLite or API |
 | `--resume` | off | Restart from checkpoint; appends to existing CSV |
+| `--cross-assay` | off | Find XC50–XC50 pairs **across assays** on the same target. Uses each molecule's best pXC50 from any assay. Essential for well-characterised targets (e.g. EGFR, CA-II) where IC50s are spread across hundreds of assays from different papers. Without this flag, both compounds must be in the exact same assay — rarely satisfied. |
+| `--min-confidence` | `8` | Minimum ChEMBL assay confidence score. Default 8 = direct assay, single protein. Use `--min-confidence 7` when the target is a protein complex or heterodimer (most assays receive score 7 rather than 8). |
+| `--relax-quality` | off | Skip the `potential_duplicate = 0` filter. ChEMBL sometimes over-flags replicated multi-lab measurements as duplicates. The `data_validity_comment` outlier filter is still applied. |
+| `--chain-only` | off | **Biomimetics mode**: only consecutive pXC50-sorted pairs per assay. Eliminates star topology. Use with `--delta-pxic50 < 1.5`. |
+| `--best-partner-only` | off | Keep only the highest-SALI inactive partner per active compound per assay. Lighter than `--chain-only`. |
+| `--min-pxc50` | none | Exclude compounds weaker than this pXC50 (e.g. `--min-pxc50 5.0` drops IC50 > 10 µM). |
 
 ### Assay-type strictness hierarchy
 
@@ -170,6 +175,35 @@ python activity_cliff_scanner.py --demo
 | *(none)* | None — any cross-assay pair | Most (268 K+ in full proteome run) |
 | `--same-assay-type` | B↔B or F↔F only | Subset — removes cross-biology pairs |
 | `--xc50-only` | Same assay, XC50 only | Fewest — highest confidence |
+
+### Biomimetics vs activity cliffs — pair-reduction modes
+
+At low `--delta-pxic50` (e.g. 0.5) a focused series of N compounds generates up to
+N(N−1)/2 pairs — each "active" compound paired with every less-active structural
+neighbor (star topology). Three mechanisms control this:
+
+| Mode | Flag | Mechanism | Pairs produced |
+|---|---|---|---|
+| Unrestricted | *(none)* | All pairwise combinations | O(N²) |
+| Best-partner | `--best-partner-only` | Keep highest-SALI partner per active | ≤ N |
+| Chain | `--chain-only` | Consecutive pXC50 neighbours only | ≤ N−1 |
+
+**SALI** (Structure-Activity Landscape Index) = `|ΔpXC50| / (1 − Tanimoto)` is added as
+a column to every output. Use it to distinguish:
+- SALI > 10 → classic activity cliff (large potency jump, very similar structure)
+- SALI 1–10 → biomimetic / gradual SAR region (small change gives modest gain)
+
+**Recommended biomimetics run:**
+```bash
+python activity_cliff_scanner.py \
+    --sqlite "C:/path/to/chembl_37_sqlite" \
+    --target CHEMBL2608 \
+    --tanimoto 0.85 \
+    --delta-pxic50 0.5 \
+    --chain-only \
+    --min-pxc50 5.0 \
+    --output CHEMBL2608_biomimetics.csv
+```
 
 ### Measurement types included
 
@@ -199,11 +233,12 @@ Use `--resume` to skip already-processed assays on restart. Nothing is lost if t
 
 ### Assay confidence scores
 
-| Score | Meaning |
-|---|---|
-| 9 | Direct assay, single protein, exact compound tested |
-| 8 | Direct assay, single protein |
-| **≤ 7** | **Excluded** — homologous protein, multi-protein complex, or inferred |
+| Score | Meaning | Default included |
+|---|---|---|
+| 9 | Direct assay, single protein, exact compound tested | ✓ |
+| 8 | Direct assay, single protein | ✓ |
+| **7** | **Direct assay, protein complex / heterodimer** | use `--min-confidence 7` |
+| ≤ 6 | Inferred / homologous / family-level target | ✗ |
 
 ---
 
@@ -384,6 +419,11 @@ python cliff_dashboard.py \
 | `--cliff-type` | `all` | `XC50`, `pct_fallback`, or `all` |
 | `--skip-3d` | off | Skip ETKDGv3 + MMFF conformer generation and RMSD |
 
+New columns visible in the table and detail modal when present in the input CSV:
+- **SALI** — sortable column showing Structure-Activity Landscape Index per pair
+- **Raw XC50** — original concentration (nM or µM) shown under pXC50 in each molecule cell
+- **Measurement type** — IC50 / EC50 / Ki / Kd shown as small label
+
 ### RMSD interpretation
 
 | RMSD (Å) | Interpretation |
@@ -394,14 +434,133 @@ python cliff_dashboard.py \
 
 ---
 
+
+## Cross-assay XC50 pairing — `--cross-assay`
+
+### The problem: pct_fallback dominates without this flag
+
+The scanner's default XC50–XC50 mode requires **both compounds to be in the exact same ChEMBL assay**.  
+For well-characterised targets, ChEMBL organises IC50 data like this:
+
+```
+Paper 1 → Assay CHEMBL_A:  Cpd1 (5 nM),  Cpd2 (50 nM)
+Paper 2 → Assay CHEMBL_B:  Cpd3 (8 nM),  Cpd4 (500 nM)
+Paper 3 → Assay CHEMBL_C:  Cpd5 (12 nM), Cpd1 (6 nM)
+HTS     → Assay CHEMBL_D:  All compounds → % inhibition
+```
+
+| Mode | Grouping key | Pairs found |
+|---|---|---|
+| XC50–XC50 (default) | `assay_chembl_id` | Only pairs where BOTH compounds are in the **same assay** (often 0–2 per target) |
+| pct_fallback | `target_chembl_id` | Any XC50 compound vs any %inh compound from **any assay on the target** |
+| XC50–XC50 `--cross-assay` | `target_chembl_id` | Best pXC50 per molecule per target, compared across all assays |
+
+Result without `--cross-assay`: the dashboard shows **only pct_fallback pairs** because same-assay XC50 grouping finds almost nothing for targets with data spread across many publications.
+
+### How `--cross-assay` works
+
+1. For each *(molecule, target)* pair, keep only the single **best pXC50** value across all assays.
+2. Group all molecules by target (instead of by assay).
+3. Run the normal Tanimoto + ΔpXC50 cliff detection across the full compound set.
+4. The original `assay_chembl_id` is preserved in the output row so the measurement provenance is always known.
+
+This mirrors how a medicinal chemist reads an SAR table — they compare the best reported IC50 for each compound, regardless of which paper or lab produced it.
+
+### When to use it
+
+```bash
+# Targets with IC50s spread across many assays (most well-characterised targets)
+python activity_cliff_scanner.py \
+    --sqlite "C:/path/to/chembl_37_sqlite" \
+    --target CHEMBL1977 \
+    --cross-assay \
+    --min-confidence 7 \
+    --output CHEMBL1977_cliffs.csv
+
+# Combine with biomimetics mode
+python activity_cliff_scanner.py \
+    --sqlite "C:/path/to/chembl_37_sqlite" \
+    --target CHEMBL1977 \
+    --cross-assay \
+    --tanimoto 0.85 --delta-pxic50 0.5 \
+    --chain-only --min-pxc50 5.0 \
+    --output CHEMBL1977_biomimetics.csv
+```
+
+### Diagnostic SQL — why are thousands of IC50s missing?
+
+Save and run against your ChEMBL SQLite to pinpoint which filter is removing the most records:
+
+```sql
+-- 1. Total raw IC50s (no scanner filters)
+SELECT COUNT(*) AS total_raw
+FROM activities act
+JOIN assays ass ON act.assay_id = ass.assay_id
+JOIN target_dictionary td ON ass.tid = td.tid
+WHERE td.chembl_id = 'CHEMBL1977' AND act.standard_type = 'IC50';
+
+-- 2. Confidence score distribution (reveals if score < 8 holds most data)
+SELECT ass.confidence_score, COUNT(*) AS n_ic50
+FROM activities act
+JOIN assays ass ON act.assay_id = ass.assay_id
+JOIN target_dictionary td ON ass.tid = td.tid
+WHERE td.chembl_id = 'CHEMBL1977' AND act.standard_type = 'IC50'
+GROUP BY ass.confidence_score ORDER BY ass.confidence_score DESC;
+
+-- 3. Relation distribution (reveals how many are >, <, =)
+SELECT act.standard_relation, COUNT(*) AS n_ic50
+FROM activities act
+JOIN assays ass ON act.assay_id = ass.assay_id
+JOIN target_dictionary td ON ass.tid = td.tid
+WHERE td.chembl_id = 'CHEMBL1977' AND act.standard_type = 'IC50'
+GROUP BY act.standard_relation ORDER BY n_ic50 DESC;
+
+-- 4. After all scanner filters (what the scanner actually retrieves)
+SELECT COUNT(*) AS scanner_retrieves
+FROM activities act
+JOIN assays ass ON act.assay_id = ass.assay_id
+JOIN target_dictionary td ON ass.tid = td.tid
+JOIN molecule_dictionary md ON act.molregno = md.molregno
+JOIN compound_structures cs ON act.molregno = cs.molregno
+WHERE td.chembl_id = 'CHEMBL1977'
+  AND act.standard_type = 'IC50'
+  AND ass.confidence_score >= 8
+  AND act.standard_relation = '='
+  AND act.standard_value IS NOT NULL
+  AND cs.canonical_smiles IS NOT NULL
+  AND act.standard_units IN ('nM','uM','µM','μM','pM','nmol/l','umol/l','mM','M')
+  AND (act.potential_duplicate = 0 OR act.potential_duplicate IS NULL)
+  AND (act.data_validity_comment IS NULL OR act.data_validity_comment = 'Manually validated');
+```
+
+The difference between query 1 and query 4 shows exactly which filter is responsible.  
+Most common culprits:
+
+| Filter | Impact |
+|---|---|
+| `confidence_score >= 8` | Protein complexes / heterodimers receive score 7 → use `--min-confidence 7` |
+| `standard_relation = '='` | Removes `>10000 nM` (inactives) and `<1 nM` (very potent) — legitimate data |
+| `potential_duplicate = 0` | ChEMBL over-flags multi-lab replicates → use `--relax-quality` |
+
 ## Recommended workflow
 
 ```bash
-# Step 1: scan — same assay-type filter (B↔B, F↔F)
+# Step 1a: scan — classic activity cliffs (cross-assay, default delta=2.0)
 python activity_cliff_scanner.py \
     --sqlite "C:/path/to/chembl_37_sqlite" \
+    --cross-assay \
     --same-assay-type \
     --output all_cliffs.csv
+
+# Step 1b: biomimetics / low-delta scan on a specific target
+python activity_cliff_scanner.py \
+    --sqlite "C:/path/to/chembl_37_sqlite" \
+    --target CHEMBL1977 \
+    --cross-assay \
+    --tanimoto 0.85 --delta-pxic50 0.5 \
+    --chain-only --min-pxc50 5.0 \
+    --min-confidence 7 \
+    --output CHEMBL1977_biomimetics.csv
 
 # Step 2: enrich — SIFTS offline protein class + PDB annotation
 python cliff_enrich.py \
@@ -439,6 +598,7 @@ python cliff_dashboard.py \
 | `inactive_std_type` | str | Measurement type |
 | `inactive_pct_activity` | float | % inhibition at ~10 µM; pct_fallback only |
 | `delta_pXC50` | float | \|active_pXC50 − inactive_pXC50\|; NaN for pct_fallback |
+| `sali` | float | Structure-Activity Landscape Index = \|ΔpXC50\| / (1 − Tanimoto). High = true cliff; Low = biomimetic. |
 | `assay_chembl_id` | str | ChEMBL assay ID (renamed to `active_assay_chembl_id` by enricher) |
 | `target_chembl_id` | str | ChEMBL target ID |
 | `target_name` | str | Target preferred name |
@@ -457,7 +617,8 @@ python cliff_dashboard.py \
 
 | Column | Source | Notes |
 |---|---|---|
-| `tanimoto_ecfp4` | RDKit | ECFP4 Tanimoto similarity (4 d.p.) |
+| `sali` | Scanner | Structure-Activity Landscape Index = \|ΔpXC50\| / (1−Tanimoto). In output from scanner directly. |
+| `tanimoto_ecfp4` | RDKit (enricher) | ECFP4 Tanimoto similarity (4 d.p.) — added by cliff_enrich.py |
 | `active_assay_chembl_id` | Renamed | Assay of the active measurement |
 | `inactive_assay_chembl_id` | SQLite / same | Assay of the inactive; differs for pct_fallback |
 | `protein_class_l1` | SIFTS / SQLite / REST | Enzyme, Membrane receptor, Nuclear receptor, Ion channel, Transporter |
@@ -600,4 +761,72 @@ Cliff detection only compares compounds **within the same group**. The grouping 
 - Compound IDs are auto-generated as `EXT_00001`, `EXT_00002`… if no ID column is found.
 - Assay confidence score is set to 9 (trusted external data).
 - No ChEMBL lookup is performed — `uniprot_id`, `target_name` etc. are populated from the target column or left as `EXTERNAL_TARGET`.
+
+
+---
+
+## Biomimetics and low-delta mode
+
+When `--delta-pxic50` is lowered to 0.5–1.0, the scanner switches from finding
+**activity cliffs** (large potency gaps) to finding **biomimetics** — structurally
+very similar compounds with small but reproducible activity differences.  These
+pairs reveal:
+
+- Subtle pharmacophoric contributions of individual atoms or functional groups
+- Bioisosteric replacements with measurable potency changes
+- SAR gradients within a focused optimisation series
+
+The tradeoff: at delta=0.5 and Tanimoto=0.85, one highly-active compound can
+legitimately pair against 5–10 structural neighbours, producing a redundant
+**star topology** where the same active compound is repeated at the centre of
+many pairs.  Three new flags address this.
+
+### New scanner flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--chain-only` | off | **Biomimetics mode.** Within each assay, sort compounds by pXC50 descending and only report *consecutive* pairs. Compound A is compared only to its immediate lower-activity neighbour. Eliminates star-topology redundancy. Recommended with `--delta-pxic50 < 1.5`. |
+| `--best-partner-only` | off | For each active compound keep only its single highest-SALI inactive partner. Less strict than `--chain-only`. Useful when multiple distinct structural series are present in one assay. |
+| `--min-pxc50` | none | Exclude compounds below this pXC50 from the comparison. With delta=0.5 you would otherwise pair two very weak binders (e.g. pXC50=4.5 vs 4.0). `--min-pxc50 5.0` keeps only compounds with IC50 ≤ 10 µM. |
+
+### SALI — Structure-Activity Landscape Index
+
+Every pair now includes a `sali` column:
+
+```
+SALI = |ΔpXC50| / (1 − Tanimoto)
+```
+
+| SALI range | Interpretation |
+|---|---|
+| < 3 | **Biomimetic** — small structural change, small activity gain; valuable for SAR optimisation |
+| 3–8 | Intermediate — notable activity change relative to structural similarity |
+| > 8 | **Activity cliff** — large potency gap from a minor structural change; reveals critical pharmacophore |
+
+SALI is displayed as a colour-coded badge in the dashboard:
+- 🔵 Blue `< 3` — biomimetic
+- 🟠 Orange `3–8` — intermediate
+- 🔴 Red `> 8` — true cliff
+
+### Recommended biomimetics run
+
+```bash
+python activity_cliff_scanner.py \
+    --sqlite "C:/path/to/chembl_37_sqlite" \
+    --target CHEMBL2608 \
+    --tanimoto 0.85 \
+    --delta-pxic50 0.5 \
+    --chain-only \
+    --min-pxc50 5.0 \
+    --output CHEMBL2608_biomimetics.csv
+```
+
+### Topology comparison
+
+| Mode | Pairs for 6 analogues | SAR picture |
+|---|---|---|
+| Default (delta=2.0) | 0–2 | Identifies hard cliffs only |
+| Low delta, no flags (delta=0.5) | Up to 15 (star) | Redundant — same active repeated |
+| `--chain-only` (delta=0.5) | ≤ 5 (ladder) | Clean step-by-step SAR |
+| `--best-partner-only` (delta=0.5) | ≤ 6 (one per active) | Collapsed star — best partner retained |
 
