@@ -108,7 +108,7 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ?????????????????????????????????????????????????????????????????????????????
 
-CONFIDENCE_CUTOFF   = 8
+CONFIDENCE_CUTOFF   = 8     # default; override with --min-confidence
 TANIMOTO_CUTOFF     = 0.95
 DELTA_PXIC50_CUTOFF = 2.0
 ECFP_RADIUS         = 2
@@ -152,6 +152,13 @@ CHEMBL_API_BASE = "https://www.ebi.ac.uk/chembl/api/data"
 #   standard_relation = '='  ? excludes ">" / "<" threshold-only values
 SQLITE_QUALITY_FILTER = """
     AND (act.potential_duplicate = 0 OR act.potential_duplicate IS NULL)
+    AND (act.data_validity_comment IS NULL
+         OR act.data_validity_comment = 'Manually validated')
+"""
+
+# Relaxed: keeps potential_duplicate records (useful for targets where
+# ChEMBL over-flags duplicates from multi-lab replications)
+SQLITE_QUALITY_FILTER_RELAXED = """
     AND (act.data_validity_comment IS NULL
          OR act.data_validity_comment = 'Manually validated')
 """
@@ -210,12 +217,28 @@ _TE  = rdMolStandardize.TautomerEnumerator()
 _TE.SetMaxTautomers(MAX_TAUTOMERS)
 _LFC = rdMolStandardize.LargestFragmentChooser()
 _UN  = rdMolStandardize.Uncharger()          # for salt-form normalisation
+_LFC_ORG = rdMolStandardize.LargestFragmentChooser(preferOrganic=True)
+
+
+def desalt_mol(mol):
+    """Parent molecule: largest organic fragment, neutralised.
+    Strips counter-ions / solvates (HCl, Na+, TFA, water ...). None -> None.
+    Every molecule the scanner parses goes through this, so fingerprints,
+    InChIKeys, pair detection and the output SMILES are all salt-free."""
+    if mol is None:
+        return None
+    try:
+        if len(Chem.GetMolFrags(mol)) > 1:
+            mol = _LFC_ORG.choose(mol)
+        return _UN.uncharge(mol)
+    except Exception:
+        return mol
 
 
 def smi_to_mol(smiles: str) -> Optional[Chem.Mol]:
     if not smiles or not isinstance(smiles, str):
         return None
-    return Chem.MolFromSmiles(smiles.strip())
+    return desalt_mol(Chem.MolFromSmiles(smiles.strip()))
 
 def mol_to_fp(mol: Optional[Chem.Mol]):
     return _MG.GetFingerprint(mol) if mol is not None else None
@@ -381,9 +404,11 @@ WHERE  ass.confidence_score >= {conf}
 
 
 def fetch_xc50_from_sqlite(
-    db_path:   str,
-    target_id: Optional[str] = None,
-    max_records: int = 0,          # 0 = no limit
+    db_path:        str,
+    target_id:      Optional[str] = None,
+    max_records:    int = 0,
+    min_confidence: int = CONFIDENCE_CUTOFF,
+    relax_quality:  bool = False,
 ) -> pd.DataFrame:
     """
     Pull all XC50-type binding measurements (IC50, EC50, Ki, Kd, AC50?)
@@ -402,11 +427,12 @@ def fetch_xc50_from_sqlite(
     target_sql, target_params = _target_clause(target_id)
     limit_clause = f"LIMIT {max_records}" if max_records > 0 else ""
 
+    quality = SQLITE_QUALITY_FILTER_RELAXED if relax_quality else SQLITE_QUALITY_FILTER
     sql = (
         _SQL_XC50.format(
-            conf=CONFIDENCE_CUTOFF,
+            conf=min_confidence,
             placeholders=ph,
-            quality=SQLITE_QUALITY_FILTER,
+            quality=quality,
             target_clause=target_sql,
         )
         + limit_clause
@@ -455,20 +481,23 @@ WHERE  ass.confidence_score >= {conf}
 
 
 def fetch_pct_from_sqlite(
-    db_path:   str,
-    target_id: Optional[str] = None,
-    max_records: int = 0,
+    db_path:        str,
+    target_id:      Optional[str] = None,
+    max_records:    int = 0,
+    min_confidence: int = CONFIDENCE_CUTOFF,
+    relax_quality:  bool = False,
 ) -> pd.DataFrame:
     db_path = find_sqlite_db(db_path)
     ph = ", ".join(["?"] * len(PCT_TYPES))
     target_sql, target_params = _target_clause(target_id)
     limit_clause = f"LIMIT {max_records}" if max_records > 0 else ""
 
+    quality = SQLITE_QUALITY_FILTER_RELAXED if relax_quality else SQLITE_QUALITY_FILTER
     sql = (
         _SQL_PCT.format(
-            conf=CONFIDENCE_CUTOFF,
+            conf=min_confidence,
             placeholders=ph,
-            quality=SQLITE_QUALITY_FILTER,
+            quality=quality,
             target_clause=target_sql,
         )
         + limit_clause
@@ -833,8 +862,13 @@ def preprocess_xc50(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["pXC50"])
 
     # Chemistry objects
-    df["mol"]           = df["canonical_smiles"].map(smi_to_mol)
+    n_salt = int(df["canonical_smiles"].astype(str).str.contains(".", regex=False).sum())
+    df["mol"]           = df["canonical_smiles"].map(smi_to_mol)   # desalted parent
     df = df[df["mol"].notna()]
+    # Replace registered SMILES with the desalted parent so that the cliff
+    # output (active_smiles / inactive_smiles) never contains counter-ions.
+    df["canonical_smiles"] = df["mol"].map(Chem.MolToSmiles)
+    logger.info(f"  Desalted {n_salt:,} multi-component SMILES (largest fragment + neutralised)")
     df["fp"]            = df["mol"].map(mol_to_fp)
     df["inchikey"]      = df["mol"].map(inchikey_from_mol)
     df["parent_inchikey"] = df["mol"].map(parent_inchikey_from_mol)
@@ -853,6 +887,43 @@ def preprocess_xc50(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def make_cross_assay_view(df_proc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a cross-assay XC50 view for --cross-assay mode.
+
+    For each (molecule, target) pair keep only the single BEST pXC50 value
+    across all assays.  Then set a virtual group key:
+        assay_chembl_id = target_chembl_id
+    so that find_cliffs_xc50 compares all molecules for the same target
+    against each other regardless of which assay they came from.
+
+    This is how a medicinal chemist reads a compound table — the "best
+    reported IC50 for this target" — and mirrors the comparison that
+    pct_fallback already does cross-assay.
+
+    The original assay_chembl_id is preserved in a new column
+    `source_assay_chembl_id` so the output still records where each
+    measurement came from.
+    """
+    if df_proc.empty:
+        return df_proc
+
+    df = df_proc.copy()
+
+    # Keep best pXC50 per (molecule, target) — one row per compound per target
+    df = df.sort_values("pXC50", ascending=False)
+    df = df.drop_duplicates(subset=["molecule_chembl_id", "target_chembl_id"])
+    df = df.drop_duplicates(subset=["inchikey",           "target_chembl_id"])
+    df = df.drop_duplicates(subset=["parent_inchikey",    "target_chembl_id"])
+
+    # Rename original assay column; set virtual group key = target
+    df = df.rename(columns={"assay_chembl_id": "source_assay_chembl_id"})
+    df["assay_chembl_id"] = df["target_chembl_id"]
+
+    logger.info(f"  Cross-assay XC50 records (best per molecule per target): {len(df):,}")
+    return df.reset_index(drop=True)
+
+
 def preprocess_pct(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -864,8 +935,9 @@ def preprocess_pct(df: pd.DataFrame) -> pd.DataFrame:
         df["conc_val"] = pd.to_numeric(df["assay_concentration_value"], errors="coerce")
         df = df[df["conc_val"].between(PCT_CONC_UM_LO, PCT_CONC_UM_HI) | df["conc_val"].isna()]
 
-    df["mol"] = df["canonical_smiles"].map(smi_to_mol)
+    df["mol"] = df["canonical_smiles"].map(smi_to_mol)         # desalted parent
     df = df[df["mol"].notna()]
+    df["canonical_smiles"] = df["mol"].map(Chem.MolToSmiles)
     df["fp"]  = df["mol"].map(mol_to_fp)
     df = df[df["fp"].notna()]
     df = (
@@ -1064,7 +1136,9 @@ def find_cliffs_xc50(
                         "inactive_std_type":  ri.get("standard_type", ""),
                         "delta_pXC50":        round(float(dp), 4),
                         "sali":               round(float(dp) / (1.0 - float(sim_ij) + 1e-9), 4),
-                        "assay_chembl_id":    assay_id,
+                        # In cross-assay mode assay_id = target_chembl_id (virtual key).
+                        # Use source_assay_chembl_id if present so the real assay is reported.
+                        "assay_chembl_id":    (ra.get("source_assay_chembl_id") or assay_id),
                         "target_chembl_id":   ra.get("target_chembl_id", "N/A"),
                         "target_name":        ra.get("target_name", "N/A"),
                         "target_organism":    ra.get("target_organism", "N/A"),
@@ -1416,6 +1490,34 @@ def parse_args():
                        "per assay. Less strict than --chain-only. "
                        "SALI = delta_pXC50 / (1 - Tanimoto)."
                    ))
+    p.add_argument("--cross-assay", action="store_true",
+                   help=(
+                       "Find XC50-XC50 pairs ACROSS assays on the same target. "
+                       "For each molecule, uses its best pXC50 from any assay on that target. "
+                       "This is how a medicinal chemist reads an SAR table — the best reported "
+                       "IC50 regardless of which assay it came from. "
+                       "Essential for well-characterized targets (e.g. CA-II, EGFR) where IC50s "
+                       "are spread across hundreds of different assays from different papers. "
+                       "Without this flag, XC50-XC50 pairs require both compounds in the SAME "
+                       "assay, which is rarely satisfied."
+                   ))
+    p.add_argument("--min-confidence", type=int, default=CONFIDENCE_CUTOFF,
+                   metavar="N",
+                   help=(
+                       "Minimum ChEMBL assay confidence score (default 8). "
+                       "Score 8 = direct assay, single protein. "
+                       "Score 7 = direct assay on protein complex/heterodimer. "
+                       "Use --min-confidence 7 if your target (e.g. a kinase complex "
+                       "or GPCR) has thousands of IC50s that do not appear at score 8."
+                   ))
+    p.add_argument("--relax-quality", action="store_true",
+                   help=(
+                       "Remove the potential_duplicate=0 quality filter. "
+                       "ChEMBL sometimes over-flags replicated measurements "
+                       "from multi-lab studies as 'potential duplicates', "
+                       "causing legitimate IC50s to disappear. "
+                       "data_validity_comment outlier filter is still applied."
+                   ))
     p.add_argument("--min-pxc50", type=float, default=None,
                    help=(
                        "Exclude compounds weaker than this pXC50 from cliff comparison "
@@ -1468,7 +1570,10 @@ def main():
     logger.info("?" * 60)
     logger.info("  Activity Cliff Scanner  v3  (ChEMBL/ECFP4)")
     logger.info("?" * 60)
-    logger.info(f"  Confidence cutoff  : >= {CONFIDENCE_CUTOFF}")
+    logger.info(f"  Confidence cutoff  : >= {args.min_confidence}"
+                + (" (relaxed from default 8 — includes protein complexes)"
+                   if args.min_confidence < 8 else ""))
+    logger.info(f"  Tanimoto           : >= {args.tanimoto}")
     logger.info(f"  Tanimoto           : >= {args.tanimoto}")
     logger.info(f"  |?pXC50|           : >= {args.delta_pxic50}")
     logger.info(f"  Intermediate check : {not args.no_intermediate_check}")
@@ -1506,11 +1611,15 @@ def main():
             db_path,
             target_id=args.target,
             max_records=args.max_records,
+            min_confidence=args.min_confidence,
+            relax_quality=args.relax_quality,
         )
         df_pct_raw = fetch_pct_from_sqlite(
             db_path,
             target_id=args.target,
             max_records=args.max_records // 4 if args.max_records > 0 else 0,
+            min_confidence=args.min_confidence,
+            relax_quality=args.relax_quality,
         )
         # Fetch target metadata from SQLite (no REST needed)
         logger.info("\n[Step 1b] Fetching target metadata from SQLite?")
@@ -1565,16 +1674,27 @@ def main():
         logger.error("No XC50 data loaded. Check your filters or data source.")
         sys.exit(1)
 
-    # ?? Preprocess ????????????????????????????????????????????????????????
-    logger.info("\n[Step 2] Preprocessing?")
+    # ── Preprocess ────────────────────────────────────────────────────────
+    logger.info("\n[Step 2] Preprocessing…")
     df_proc     = preprocess_xc50(df_raw)
     df_pct_proc = preprocess_pct(df_pct_raw) if not df_pct_raw.empty else pd.DataFrame()
 
-    # ?? Cliff detection ???????????????????????????????????????????????????
-    logger.info("\n[Step 3] Detecting activity cliffs?")
-    # XC50 cliffs are written incrementally to disk; returns total pair count.
+    # ── Cliff detection ───────────────────────────────────────────────────
+    logger.info("\n[Step 3] Detecting activity cliffs…")
+
+    # Choose grouping: same-assay (default) or cross-assay (--cross-assay)
+    if args.cross_assay:
+        logger.info(
+            "  --cross-assay: using best pXC50 per molecule per target "
+            "(groups by target, not assay)"
+        )
+        df_for_xc50 = make_cross_assay_view(df_proc)
+    else:
+        df_for_xc50 = df_proc
+
+    # XC50 cliffs written incrementally to disk; returns total pair count.
     n_xc50 = find_cliffs_xc50(
-        df_proc,
+        df_for_xc50,
         tanimoto_thresh=args.tanimoto,
         delta_p=args.delta_pxic50,
         check_intermediate=(not args.no_intermediate_check),
