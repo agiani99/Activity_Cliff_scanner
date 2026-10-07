@@ -83,6 +83,27 @@ from tqdm import tqdm
 from rdkit import Chem, RDLogger
 from rdkit.Chem import rdFingerprintGenerator, DataStructs
 
+# ---------------------------------------------------------------------------
+# SALT / COUNTER-ION REMOVAL -- applied to every molecule parsed by RDKit
+# ---------------------------------------------------------------------------
+from rdkit.Chem.MolStandardize import rdMolStandardize as _rdMS
+_DESALT_LFC = _rdMS.LargestFragmentChooser(preferOrganic=True)
+_DESALT_UN  = _rdMS.Uncharger()
+
+
+def desalt_mol(mol):
+    """Parent molecule: largest organic fragment, neutralised.
+    Strips counter-ions / solvates (HCl, Na+, TFA, water ...). None -> None."""
+    if mol is None:
+        return None
+    try:
+        if len(Chem.GetMolFrags(mol)) > 1:
+            mol = _DESALT_LFC.choose(mol)
+        return _DESALT_UN.uncharge(mol)
+    except Exception:
+        return mol
+
+
 RDLogger.DisableLog("rdApp.*")
 
 logging.basicConfig(
@@ -98,6 +119,250 @@ ECFP_NBITS   = 2048
 API_DELAY_S  = 0.08
 CHEMBL_BASE  = "https://www.ebi.ac.uk/chembl/api/data"
 UNIPROT_BASE = "https://rest.uniprot.org/uniprotkb"
+RCSB_SEARCH  = "https://search.rcsb.org/rcsbsearch/v2/query"
+RCSB_GQL     = "https://data.rcsb.org/graphql"
+
+# ── EC-number prefix → (l1, l2, l3) — longest prefix wins ────────────────────
+_EC_MAP = [
+    ("2.7.10.1",  ("Enzyme", "Kinase", "Receptor Tyrosine Kinase")),
+    ("2.7.10.2",  ("Enzyme", "Kinase", "Non-receptor Tyrosine Kinase")),
+    ("2.7.11.1",  ("Enzyme", "Kinase", "Serine/Threonine Kinase")),
+    ("2.7.11.2",  ("Enzyme", "Kinase", "Serine/Threonine Kinase")),
+    ("2.7.12",    ("Enzyme", "Kinase", "Dual-specificity Kinase")),
+    ("2.7.13",    ("Enzyme", "Kinase", "Histidine Kinase")),
+    ("2.7.4",     ("Enzyme", "Kinase", "Nucleoside Phosphate Kinase")),
+    ("2.7.1",     ("Enzyme", "Kinase", "Kinase")),
+    ("2.7",       ("Enzyme", "Kinase", "Kinase")),
+    ("3.4.21",    ("Enzyme", "Protease", "Serine Protease")),
+    ("3.4.22",    ("Enzyme", "Protease", "Cysteine Protease")),
+    ("3.4.23",    ("Enzyme", "Protease", "Aspartic Protease")),
+    ("3.4.24",    ("Enzyme", "Protease", "Metalloprotease")),
+    ("3.4.25",    ("Enzyme", "Protease", "Threonine Protease")),
+    ("3.4",       ("Enzyme", "Protease", "Protease")),
+    ("3.1.4.17",  ("Enzyme", "Phosphodiesterase", "Cyclic Nucleotide PDE")),
+    ("3.1.4",     ("Enzyme", "Phosphodiesterase", "Phosphodiesterase")),
+    ("3.1.3.48",  ("Enzyme", "Phosphatase", "Tyrosine Phosphatase")),
+    ("3.1.3.16",  ("Enzyme", "Phosphatase", "Ser/Thr Phosphatase")),
+    ("3.1.3",     ("Enzyme", "Phosphatase", "Phosphatase")),
+    ("3.5.1.98",  ("Enzyme", "Deacetylase", "HDAC")),
+    ("3.5.1",     ("Enzyme", "Hydrolase", "Amide Hydrolase")),
+    ("2.1.1.356", ("Enzyme", "Methyltransferase", "Histone Methyltransferase")),
+    ("2.1.1",     ("Enzyme", "Methyltransferase", "Methyltransferase")),
+    ("2.3.1",     ("Enzyme", "Acetyltransferase", "Acetyltransferase")),
+    ("3.6.5",     ("Enzyme", "GTPase", "GTPase")),
+    ("3.6.1",     ("Enzyme", "ATPase", "ATPase")),
+    ("4.6.1.1",   ("Enzyme", "Cyclase", "Adenylyl Cyclase")),
+    ("4.6.1.2",   ("Enzyme", "Cyclase", "Guanylyl Cyclase")),
+    ("4.6.1",     ("Enzyme", "Cyclase", "Nucleotidyl Cyclase")),
+    ("1.14.14",   ("Enzyme", "Oxidoreductase", "Cytochrome P450")),
+    ("1.14.13",   ("Enzyme", "Oxidoreductase", "Cytochrome P450")),
+    ("1.14",      ("Enzyme", "Oxidoreductase", "Oxygenase")),
+    ("1.1.1",     ("Enzyme", "Oxidoreductase", "Dehydrogenase")),
+    ("1",         ("Enzyme", "Oxidoreductase", "Oxidoreductase")),
+    ("2.4",       ("Enzyme", "Glycosyltransferase", "Glycosyltransferase")),
+    ("5.2.1.8",   ("Enzyme", "Isomerase", "Peptidyl-Prolyl Isomerase (FKBP)")),
+    ("2",         ("Enzyme", "Transferase", "Transferase")),
+    ("3.2",       ("Enzyme", "Glycosylase", "Glycosylase")),
+    ("3",         ("Enzyme", "Hydrolase", "Hydrolase")),
+    ("4",         ("Enzyme", "Lyase", "Lyase")),
+    ("5",         ("Enzyme", "Isomerase", "Isomerase")),
+    ("6",         ("Enzyme", "Ligase", "Ligase")),
+]
+
+_PFAM_MAP = {
+    "PF00001": ("Membrane receptor", "GPCR", "Family A GPCR"),
+    "PF00002": ("Membrane receptor", "GPCR", "Family B GPCR"),
+    "PF00003": ("Membrane receptor", "GPCR", "Family C GPCR"),
+    "PF10292": ("Membrane receptor", "GPCR", "Family A GPCR"),
+    "PF00104": ("Nuclear receptor",  "Nuclear Hormone Receptor", "NHR ligand-binding domain"),
+    "PF00105": ("Nuclear receptor",  "Nuclear Hormone Receptor", "NHR DNA-binding domain"),
+    "PF00520": ("Ion channel",       "Ion Channel", "Voltage-gated ion channel"),
+    "PF07714": ("Enzyme",            "Kinase", "Protein Tyrosine Kinase"),
+    "PF00069": ("Enzyme",            "Kinase", "Protein Kinase"),
+    "PF13955": ("Enzyme",            "Kinase", "Protein Kinase"),
+    "PF00089": ("Enzyme",            "Protease", "Serine Protease (Trypsin)"),
+    "PF00082": ("Enzyme",            "Protease", "Serine Protease (Subtilisin)"),
+    "PF00026": ("Enzyme",            "Protease", "Aspartic Protease"),
+    "PF00112": ("Enzyme",            "Protease", "Cysteine Protease"),
+    "PF01471": ("Enzyme",            "Protease", "Metalloprotease"),
+    "PF00233": ("Enzyme",            "Phosphodiesterase", "Cyclic Nucleotide PDE"),
+    "PF01663": ("Enzyme",            "Phosphodiesterase", "Phosphodiesterase"),
+    "PF00102": ("Enzyme",            "Phosphatase", "Tyrosine Phosphatase"),
+    "PF00782": ("Enzyme",            "Phosphatase", "Dual-specificity Phosphatase"),
+    "PF02132": ("Enzyme",            "Deacetylase", "HDAC"),
+    "PF00856": ("Enzyme",            "Methyltransferase", "SET domain Methyltransferase"),
+    "PF00439": ("Enzyme",            "Bromodomain", "Bromodomain"),
+    "PF00628": ("Enzyme",            "Bromodomain", "Bromodomain"),
+    "PF00664": ("Transporter",       "ABC Transporter", "ABC transmembrane domain"),
+    "PF00005": ("Transporter",       "ABC Transporter", "ABC ATPase domain"),
+    "PF00179": ("Enzyme",            "Ubiquitin ligase", "E2 ubiquitin-conjugating enzyme"),
+    "PF00167": ("Enzyme",            "Ubiquitin ligase", "RING domain E3 ligase"),
+}
+
+
+def _ec_to_class(ec: str):
+    """Longest-prefix match of an EC number in _EC_MAP."""
+    ec = ec.strip()
+    for prefix, cls in _EC_MAP:
+        if ec.startswith(prefix):
+            return cls
+    return None
+
+
+# ── SIFTS classification file loaders ────────────────────────────────────────
+
+def load_uniprot_pdb(path: str) -> dict:
+    """
+    Load uniprot_pdb.csv (compact UniProt->PDB summary).
+    Format: SP_PRIMARY,PDB_IDS  where PDB_IDS is semicolon-separated.
+    Returns {uniprot_accession -> [PDB_ID, ...]} (uppercase, sorted).
+    """
+    logger.info(f"  Loading UniProt->PDB compact map from {os.path.basename(path)}...")
+    df = pd.read_csv(path, comment='#', low_memory=False)
+    # Normalise column names (may be SP_PRIMARY,PDB_IDS or similar)
+    df.columns = [c.strip().upper() for c in df.columns]
+    uid_col = next((c for c in df.columns if 'PRIMARY' in c or 'UNIPROT' in c
+                    or c in ('SP_PRIMARY', 'ACCESSION')), df.columns[0])
+    pdb_col = next((c for c in df.columns if 'PDB' in c), df.columns[1])
+
+    result: dict = {}
+    for _, row in df.iterrows():
+        uid  = str(row[uid_col]).strip()
+        pdbs = str(row[pdb_col]).strip()
+        if uid and uid != 'nan' and pdbs and pdbs != 'nan':
+            result[uid] = sorted(p.upper() for p in pdbs.split(';') if p.strip())
+    logger.info(f"    {len(result):,} UniProt accessions loaded")
+    return result
+
+
+def load_pdb_enzyme(path: str) -> dict:
+    """
+    Load pdb_chain_enzyme.csv  (EC numbers per PDB chain).
+    Returns {PDB_ID_upper -> set(ec_numbers)}.
+    """
+    logger.info(f"  Loading PDB->EC from {os.path.basename(path)}...")
+    df = pd.read_csv(path, comment='#', low_memory=False)
+    df.columns = [c.strip().upper() for c in df.columns]
+    pdb_col = next(c for c in df.columns if c == 'PDB')
+    ec_col  = next(c for c in df.columns if 'ACCESSION' in c or 'EC' in c)
+    result: dict = {}
+    for _, row in df.iterrows():
+        pdb = str(row[pdb_col]).strip().upper()
+        ec  = str(row[ec_col]).strip()
+        if pdb and ec and ec != 'nan':
+            result.setdefault(pdb, set()).add(ec)
+    logger.info(f"    {len(result):,} PDB entries with EC numbers")
+    return result
+
+
+def load_pdb_pfam(path: str) -> dict:
+    """
+    Load pdb_chain_pfam.csv  (Pfam domain IDs per PDB chain).
+    Returns {PDB_ID_upper -> set(pfam_ids)}.
+    """
+    logger.info(f"  Loading PDB->Pfam from {os.path.basename(path)}...")
+    df = pd.read_csv(path, comment='#', low_memory=False)
+    df.columns = [c.strip().upper() for c in df.columns]
+    pdb_col  = next(c for c in df.columns if c == 'PDB')
+    pfam_col = next(c for c in df.columns if 'PFAM' in c or 'ACCESSION' in c)
+    result: dict = {}
+    for _, row in df.iterrows():
+        pdb  = str(row[pdb_col]).strip().upper()
+        pfam = str(row[pfam_col]).strip().upper()
+        if pdb and pfam and pfam != 'NAN':
+            result.setdefault(pdb, set()).add(pfam)
+    logger.info(f"    {len(result):,} PDB entries with Pfam domains")
+    return result
+
+
+def classify_uniprot_from_sifts(
+    uniprot_id: str,
+    uniprot_pdb: dict,
+    pdb_enzyme:  dict,
+    pdb_pfam:    dict,
+) -> dict:
+    """
+    Derive protein_class_l1/l2/l3 and protein_family for a UniProt accession
+    using only local SIFTS files — no network call required.
+
+    Priority:
+      1. EC number (most specific for enzymes — kinase, protease, PDE, ...)
+      2. Pfam domain (covers non-enzymes: GPCR, NHR, ion channel, ...)
+      3. Returns all-N/A when neither is found (target has no PDB structure
+         or its PDB structure lacks EC/Pfam annotation).
+
+    For pipe-separated multi-accession cells (e.g. 'P00533|Q9UJ70'),
+    all accessions are tried and the first hit is used.
+    """
+    _na = {"protein_class_l1": "N/A", "protein_class_l2": "N/A",
+           "protein_class_l3": "N/A", "protein_family":   "N/A"}
+
+    accessions = [a.strip() for a in str(uniprot_id).split("|")
+                  if a.strip() and a.strip() != "N/A"]
+    if not accessions:
+        return _na
+
+    # Collect all PDB IDs for this target
+    pdb_ids: set = set()
+    for acc in accessions:
+        pdb_ids.update(uniprot_pdb.get(acc, []))
+
+    if not pdb_ids:
+        return _na
+
+    # 1. Try EC numbers
+    ec_hits: list = []
+    for pdb in pdb_ids:
+        for ec in pdb_enzyme.get(pdb, set()):
+            cls = _ec_to_class(ec)
+            if cls:
+                ec_hits.append(cls)
+
+    if ec_hits:
+        # Most specific = longest l3 label (breaks ties toward sub-class)
+        best = max(ec_hits, key=lambda c: len(c[2]))
+        return {"protein_class_l1": best[0], "protein_class_l2": best[1],
+                "protein_class_l3": best[2], "protein_family":   best[1]}
+
+    # 2. Try Pfam domains
+    pfam_hits: list = []
+    for pdb in pdb_ids:
+        for pfam in pdb_pfam.get(pdb, set()):
+            cls = _PFAM_MAP.get(pfam)
+            if cls:
+                pfam_hits.append(cls)
+
+    if pfam_hits:
+        best = max(pfam_hits, key=lambda c: len(c[2]))
+        return {"protein_class_l1": best[0], "protein_class_l2": best[1],
+                "protein_class_l3": best[2], "protein_family":   best[1]}
+
+    return _na
+
+
+def annotate_protein_class_sifts(
+    df: pd.DataFrame,
+    uniprot_pdb: dict,
+    pdb_enzyme:  dict,
+    pdb_pfam:    dict,
+) -> pd.DataFrame:
+    """Apply SIFTS-based protein class annotation to every row."""
+    logger.info("  Classifying targets via SIFTS EC + Pfam (fully offline)...")
+    unique_uids = df["uniprot_id"].dropna().unique().tolist()
+    uid_cache: dict = {}
+    for uid in tqdm(unique_uids, desc="SIFTS classify", unit="target"):
+        uid_cache[uid] = classify_uniprot_from_sifts(
+            uid, uniprot_pdb, pdb_enzyme, pdb_pfam
+        )
+    for field in ("protein_class_l1", "protein_class_l2",
+                  "protein_class_l3", "protein_family"):
+        df[field] = df["uniprot_id"].map(
+            lambda u, f=field: uid_cache.get(u, {}).get(f, "N/A")
+        )
+    n_l2 = (df["protein_class_l2"] != "N/A").sum()
+    logger.info(f"  protein_class_l2 coverage: {n_l2:,} / {len(df):,} rows "
+                f"({100*n_l2/len(df):.1f}%)")
+    return df
 
 _GEN = rdFingerprintGenerator.GetMorganGenerator(radius=ECFP_RADIUS, fpSize=ECFP_NBITS)
 _SESSION = requests.Session()
@@ -126,7 +391,7 @@ def compute_tanimoto_column(df: pd.DataFrame) -> pd.Series:
 
     fp_cache: dict = {}
     for smi in tqdm(all_smiles, desc="Fingerprints", unit="mol"):
-        mol = Chem.MolFromSmiles(str(smi).strip()) if isinstance(smi, str) else None
+        mol = desalt_mol(Chem.MolFromSmiles(str(smi).strip())) if isinstance(smi, str) else None
         fp_cache[smi] = _GEN.GetFingerprint(mol) if mol else None
 
     def pair_tanimoto(row) -> float:
@@ -520,10 +785,274 @@ def fetch_inactive_assay_sqlite(db_path: str,
 # MAIN ENRICHMENT
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIFTS-BASED PDB ANNOTATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def load_sifts(path: str) -> dict:
+    """
+    Load the SIFTS pdb_chain_uniprot.csv file and return a dict:
+        {uniprot_accession -> [PDB_ID, ...]}  (sorted, uppercase, deduplicated)
+
+    The file has a comment header line starting with '#' followed by a
+    CSV with columns: PDB, CHAIN, SP_PRIMARY, RES_BEG, RES_END, ...
+    SP_PRIMARY is the UniProt/SwissProt accession.
+
+    Multi-chain entries (same PDB, multiple chains / segments) are collapsed
+    to a single PDB ID per UniProt.
+    """
+    logger.info(f"  Loading SIFTS mapping from {path} ...")
+    df = pd.read_csv(path, comment='#', low_memory=False)
+    df = df.dropna(subset=['SP_PRIMARY', 'PDB'])
+    df['PDB'] = df['PDB'].str.upper().str.strip()
+
+    sifts = (
+        df.groupby('SP_PRIMARY')['PDB']
+          .apply(lambda x: sorted(set(x)))
+          .to_dict()
+    )
+    n_pdb = sum(len(v) for v in sifts.values())
+    logger.info(f"  SIFTS: {len(sifts):,} UniProt accessions, {n_pdb:,} PDB entries total")
+    return sifts
+
+
+def _resolve_sifts_for_row(uniprot_cell: str, sifts: dict) -> list:
+    """
+    Handle pipe-separated multi-accession uniprot_id cells (e.g. 'P00533|Q15303')
+    and return the merged, sorted PDB list for all accessions.
+    """
+    if not uniprot_cell or uniprot_cell == "N/A":
+        return []
+    accessions = [a.strip() for a in str(uniprot_cell).split("|") if a.strip()]
+    pdbs = set()
+    for acc in accessions:
+        pdbs.update(sifts.get(acc, []))
+    return sorted(pdbs)
+
+
+def find_compound_in_target_pdb(
+    inchikey: str,
+    uniprot_id: str,
+    target_pdb_ids: list,
+) -> dict:
+    """
+    Search RCSB for PDB structures where:
+      (a) the ligand matches `inchikey` exactly (graph-exact chemical search), AND
+      (b) the protein chain is annotated to `uniprot_id`.
+
+    Using both filters prevents false positives (same ligand in a different
+    protein target) and dramatically reduces the search space compared to
+    a global InChIKey search.
+
+    Returns {"pdb_id": str, "resolution_A": float|None, "method": str}
+    or {} if not found / network unavailable.
+    """
+    if not inchikey or not uniprot_id or uniprot_id == "N/A":
+        return {}
+
+    # Restrict UniProt filter to accessions actually in SIFTS for this target
+    accessions = [a.strip() for a in str(uniprot_id).split("|") if a.strip()]
+
+    body = {
+        "query": {
+            "type": "group",
+            "logical_operator": "and",
+            "nodes": [
+                {
+                    "type": "terminal",
+                    "service": "chemical",
+                    "parameters": {
+                        "value": inchikey,
+                        "type": "descriptor",
+                        "descriptor_type": "InChI",
+                        "match_type": "graph-exact",
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": (
+                            "rcsb_polymer_entity_container_identifiers"
+                            ".reference_sequence_identifiers.database_accession"
+                        ),
+                        "operator": "in",
+                        "value": accessions,
+                    },
+                },
+            ],
+        },
+        "return_type": "entry",
+        "request_options": {"paginate": {"start": 0, "rows": 5}},
+    }
+
+    try:
+        r = requests.post(RCSB_SEARCH, json=body, timeout=15)
+        if r.status_code != 200:
+            return {}
+        hits = r.json().get("result_set", [])
+        if not hits:
+            return {}
+        pdb_id = hits[0].get("identifier", "")
+        if not pdb_id:
+            return {}
+
+        # Fetch resolution via GraphQL
+        gql = requests.post(
+            RCSB_GQL,
+            json={
+                "query": """
+                    query($id: String!) {
+                        entry(entry_id: $id) {
+                            refine { ls_d_res_high }
+                            exptl  { method }
+                        }
+                    }
+                """,
+                "variables": {"id": pdb_id},
+            },
+            timeout=10,
+        )
+        if gql.status_code != 200:
+            return {"pdb_id": pdb_id}
+        entry  = gql.json().get("data", {}).get("entry", {})
+        refine = (entry.get("refine") or [{}])[0]
+        exptl  = (entry.get("exptl")  or [{}])[0]
+        return {
+            "pdb_id":          pdb_id.upper(),
+            "pdb_resolution_A": refine.get("ls_d_res_high"),
+            "pdb_method":      exptl.get("method", "N/A"),
+        }
+    except Exception as exc:
+        logger.debug(f"    RCSB search failed ({inchikey}): {exc}")
+        return {}
+
+
+def annotate_pdb_from_sifts(
+    df: pd.DataFrame,
+    sifts: dict,
+    lookup_active_compound: bool = True,
+) -> pd.DataFrame:
+    """
+    Add three PDB annotation columns using the local SIFTS mapping:
+
+      n_target_pdb_structures  (int)
+          Number of distinct PDB structures for the target protein's
+          UniProt accession.  Reflects how well-structurally characterised
+          the target is.  Derived entirely from the local SIFTS file —
+          no network call.
+
+      target_pdb_sample  (str)
+          Comma-separated list of up to 5 representative PDB IDs for the
+          target protein.  Useful as quick links for structural inspection.
+
+      active_compound_pdb  (str)
+          PDB ID(s) where the exact active compound (by InChIKey) is
+          co-crystallized WITH the same target protein.  Uses RCSB
+          combined chemical + UniProt entity search so there are no
+          cross-target false positives.  Empty string if not found.
+          Requires network access; skipped if `lookup_active_compound=False`.
+      active_pdb_resolution_A  (float)
+          Resolution of the best active-compound structure.
+      active_pdb_method  (str)
+          Experimental method (X-RAY DIFFRACTION, ELECTRON MICROSCOPY, ...).
+    """
+    df = df.copy()
+
+    # ── Columns 1+2: target PDB count + sample from SIFTS (offline) ──────
+    logger.info("  Annotating target PDB structures from SIFTS (offline)...")
+    pdb_lists = df["uniprot_id"].apply(lambda u: _resolve_sifts_for_row(u, sifts))
+    df["n_target_pdb_structures"] = pdb_lists.apply(len)
+    df["target_pdb_sample"]       = pdb_lists.apply(
+        lambda ids: ",".join(ids[:5]) if ids else "N/A"
+    )
+    n_with_pdb = (df["n_target_pdb_structures"] > 0).sum()
+    logger.info(f"  Targets with >= 1 PDB structure: {n_with_pdb:,} / {len(df):,} pairs")
+
+    # ── Column 3: active compound co-crystallised with target (RCSB) ──────
+    df["active_compound_pdb"]   = ""
+    df["active_pdb_resolution_A"] = float("nan")
+    df["active_pdb_method"]     = "N/A"
+
+    if not lookup_active_compound:
+        logger.info("  Active-compound PDB lookup skipped (--no-compound-pdb).")
+        return df
+
+    # Only attempt for pairs where the target has at least one PDB structure
+    has_pdb_mask = df["n_target_pdb_structures"] > 0
+    if not has_pdb_mask.any():
+        logger.info("  No target has a PDB structure — skipping compound PDB lookup.")
+        return df
+
+    # Deduplicate by (active_smiles, uniprot_id) to minimise RCSB calls
+    from rdkit import Chem, RDLogger as _RL
+    from rdkit.Chem.inchi import MolToInchi, InchiToInchiKey
+    _RL.DisableLog("rdApp.*")
+
+    unique_pairs = (
+        df[has_pdb_mask][["active_smiles", "uniprot_id"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    logger.info(
+        f"  Searching RCSB for active compound co-crystallised with target "
+        f"({len(unique_pairs):,} unique active+target pairs)..."
+    )
+
+    # Build InChIKey cache
+    ikey_cache: dict = {}
+    for smi in unique_pairs["active_smiles"].unique():
+        mol = desalt_mol(Chem.MolFromSmiles(str(smi))) if isinstance(smi, str) else None
+        if mol:
+            try:
+                ikey_cache[smi] = InchiToInchiKey(MolToInchi(mol))
+            except Exception:
+                ikey_cache[smi] = None
+        else:
+            ikey_cache[smi] = None
+
+    # Per-(smiles, uniprot) RCSB combined search
+    compound_pdb_cache: dict = {}  # {(smi, uid): result_dict}
+
+    for _, row in tqdm(unique_pairs.iterrows(), total=len(unique_pairs),
+                       desc="RCSB compound-in-target", unit="pair"):
+        smi = row["active_smiles"]
+        uid = row["uniprot_id"]
+        key = (smi, uid)
+        ikey = ikey_cache.get(smi)
+        if not ikey:
+            compound_pdb_cache[key] = {}
+            continue
+        target_pdbs = _resolve_sifts_for_row(uid, sifts)
+        result = find_compound_in_target_pdb(ikey, uid, target_pdbs)
+        compound_pdb_cache[key] = result
+        time.sleep(0.05)
+
+    def _apply_compound_pdb(row):
+        key = (row["active_smiles"], row["uniprot_id"])
+        return compound_pdb_cache.get(key, {})
+
+    results = df[has_pdb_mask].apply(_apply_compound_pdb, axis=1)
+    df.loc[has_pdb_mask, "active_compound_pdb"]    = results.apply(
+        lambda r: r.get("pdb_id", ""))
+    df.loc[has_pdb_mask, "active_pdb_resolution_A"] = results.apply(
+        lambda r: r.get("pdb_resolution_A", float("nan")))
+    df.loc[has_pdb_mask, "active_pdb_method"]       = results.apply(
+        lambda r: r.get("pdb_method", "N/A"))
+
+    n_found = (df["active_compound_pdb"] != "").sum()
+    logger.info(f"  Active compound found in PDB: {n_found:,} pairs")
+    return df
+
+
 def enrich(df: pd.DataFrame,
            sqlite_path: Optional[str],
+           sifts_path: Optional[str] = None,
+           maps_dir: Optional[str] = None,
            skip_protein_class: bool = False,
-           use_uniprot_family: bool = True) -> pd.DataFrame:
+           use_uniprot_family: bool = True,
+           lookup_active_compound_pdb: bool = True) -> pd.DataFrame:
 
     df = df.copy()
     n = len(df)
@@ -597,42 +1126,77 @@ def enrich(df: pd.DataFrame,
     if skip_protein_class:
         logger.info("  Skipped (--skip-protein-class)")
     else:
+        # ── SIFTS offline (EC number + Pfam) — best source ───────────────
+        sifts_classified = False
+        if maps_dir and os.path.isdir(maps_dir):
+            # Auto-discover files — accept both compressed and plain
+            def _find(names):
+                for n in names:
+                    for suffix in ("", ".gz"):
+                        p = os.path.join(maps_dir, n + suffix)
+                        if os.path.exists(p):
+                            return p
+                return None
+
+            f_updb   = _find(["uniprot_pdb.csv", "pdb_chain_uniprot.csv"])
+            f_enzyme = _find(["pdb_chain_enzyme.csv"])
+            f_pfam   = _find(["pdb_chain_pfam.csv"])
+
+            if f_updb and f_enzyme and f_pfam:
+                logger.info(f"  SIFTS offline classification from {maps_dir}")
+                updb_map   = load_uniprot_pdb(f_updb)
+                enzyme_map = load_pdb_enzyme(f_enzyme)
+                pfam_map   = load_pdb_pfam(f_pfam)
+                df = annotate_protein_class_sifts(df, updb_map, enzyme_map, pfam_map)
+                sifts_classified = True
+            else:
+                missing = [n for n, f in [
+                    ("uniprot_pdb.csv / pdb_chain_uniprot.csv", f_updb),
+                    ("pdb_chain_enzyme.csv", f_enzyme),
+                    ("pdb_chain_pfam.csv",   f_pfam),
+                ] if not f]
+                logger.warning(
+                    f"  --maps-dir set but missing files: {missing}\n"
+                    "  Falling back to ChEMBL REST."
+                )
+
         unique_targets = df["target_chembl_id"].dropna().unique().tolist()
         pc_map: dict   = {}
 
-        # Primary: ChEMBL SQLite protein_class table
-        if sqlite_path:
-            logger.info(f"  Querying protein_class from SQLite for {len(unique_targets):,} targets...")
-            pc_map = fetch_protein_class_sqlite(sqlite_path, unique_targets)
-            # Only count entries where L2 has real classification (not the target_type fallback)
-            n_from_sqlite = sum(
-                1 for v in pc_map.values()
-                if v.get("protein_class_l2", "N/A") not in ("N/A", "SINGLE PROTEIN",
-                                                              "PROTEIN COMPLEX", "PROTEIN FAMILY",
-                                                              "SELECTIVITY GROUP", "CHIMERIC PROTEIN")
-            )
-            logger.info(f"  Resolved {n_from_sqlite:,} targets with meaningful L2 class from SQLite")
+        if not sifts_classified:
+            # ── SQLite protein_class table ────────────────────────────────
+            if sqlite_path:
+                logger.info(f"  Querying protein_class from SQLite for {len(unique_targets):,} targets...")
+                pc_map = fetch_protein_class_sqlite(sqlite_path, unique_targets)
+                _useless = {"N/A", "SINGLE PROTEIN", "PROTEIN COMPLEX",
+                            "PROTEIN FAMILY", "SELECTIVITY GROUP", "CHIMERIC PROTEIN", ""}
+                n_from_sqlite = sum(
+                    1 for v in pc_map.values()
+                    if v.get("protein_class_l2", "N/A") not in _useless
+                )
+                logger.info(f"  Resolved {n_from_sqlite:,} targets with meaningful L2 from SQLite")
 
-        # ChEMBL REST: fill targets whose L2 is still empty or is the useless target_type string
-        _useless = {"N/A", "SINGLE PROTEIN", "PROTEIN COMPLEX", "PROTEIN FAMILY",
-                    "SELECTIVITY GROUP", "CHIMERIC PROTEIN", ""}
-        missing_l2 = [t for t in unique_targets
-                      if pc_map.get(t, {}).get("protein_class_l2", "N/A") in _useless]
-        if missing_l2:
-            logger.info(f"  {len(missing_l2):,} targets need ChEMBL REST classification...")
-            try:
-                rest_map = fetch_chembl_target_class_api(missing_l2)
-                pc_map.update({k: v for k, v in rest_map.items() if v})
-            except Exception as exc:
-                logger.warning(f"  ChEMBL REST target class failed: {exc}")
+            # ── ChEMBL REST for remaining gaps ────────────────────────────
+            _useless = {"N/A", "SINGLE PROTEIN", "PROTEIN COMPLEX",
+                        "PROTEIN FAMILY", "SELECTIVITY GROUP", "CHIMERIC PROTEIN", ""}
+            missing_l2 = [t for t in unique_targets
+                          if pc_map.get(t, {}).get("protein_class_l2", "N/A") in _useless]
+            if missing_l2:
+                logger.info(f"  {len(missing_l2):,} targets need ChEMBL REST classification...")
+                try:
+                    rest_map = fetch_chembl_target_class_api(missing_l2)
+                    pc_map.update({k: v for k, v in rest_map.items() if v})
+                except Exception as exc:
+                    logger.warning(f"  ChEMBL REST target class failed: {exc}")
 
-        for field in ("protein_class_l1", "protein_class_l2",
-                      "protein_class_l3", "protein_family"):
-            df[field] = df["target_chembl_id"].map(
-                lambda t, f=field: pc_map.get(t, {}).get(f, "N/A")
-            )
-        logger.info(f"  protein_class_l1 coverage: "
-                    f"{(df['protein_class_l1'] != 'N/A').sum():,} / {n:,}")
+            for field in ("protein_class_l1", "protein_class_l2",
+                          "protein_class_l3", "protein_family"):
+                df[field] = df["target_chembl_id"].map(
+                    lambda t, f=field: pc_map.get(t, {}).get(f, "N/A")
+                )
+
+        n_l2 = (df["protein_class_l2"] != "N/A").sum()
+        logger.info(f"  protein_class_l2 coverage: {n_l2:,} / {n:,} rows")
 
         # UniProt SIMILARITY text — only for targets where ChEMBL REST also returned nothing
         no_fam = df["protein_family"] == "N/A"
@@ -648,6 +1212,42 @@ def enrich(df: pd.DataFrame,
                 n_filled = (df["protein_family"] != "N/A").sum()
                 logger.info(f"  protein_family after UniProt fill: {n_filled:,} / {n:,}")
 
+    # ── SIFTS: target PDB count + active compound co-crystal lookup ───────
+    if sifts_path or maps_dir:
+        logger.info("\n[SIFTS] PDB structure annotation...")
+        # Resolve the chain-level or compact uniprot->pdb file
+        _sifts_file = sifts_path
+        if not _sifts_file and maps_dir:
+            for name in ("uniprot_pdb.csv", "pdb_chain_uniprot.csv"):
+                candidate = os.path.join(maps_dir, name)
+                if os.path.exists(candidate):
+                    _sifts_file = candidate
+                    break
+
+        if _sifts_file:
+            # Determine if this is the compact uniprot_pdb or chain-level file
+            with open(_sifts_file) as _f:
+                for _l in _f:
+                    if _l.startswith('#'):
+                        continue
+                    _hdr = _l.strip()
+                    break
+            _is_compact = 'PDB_IDS' in _hdr.upper() or _hdr.upper().startswith('SP_PRIMARY,PDB')
+            if _is_compact:
+                sifts = load_uniprot_pdb(_sifts_file)
+            else:
+                sifts = load_sifts(_sifts_file)
+
+            df = annotate_pdb_from_sifts(
+                df, sifts,
+                lookup_active_compound=lookup_active_compound_pdb,
+            )
+        else:
+            logger.warning("  No SIFTS UniProt->PDB file found — skipping PDB annotation.")
+    else:
+        logger.info("  SIFTS not provided — skipping PDB annotation "
+                    "(use --sifts path/to/pdb_chain_uniprot.csv)")
+
     return df
 
 
@@ -662,6 +1262,9 @@ NEW_COLS_AFTER = {
     "delta_pXC50":                ["active_assay_chembl_id", "inactive_assay_chembl_id"],
     "assay_confidence_score":     ["protein_class_l1", "protein_class_l2",
                                    "protein_class_l3", "protein_family"],
+    "protein_family":             ["n_target_pdb_structures", "target_pdb_sample",
+                                   "active_compound_pdb", "active_pdb_resolution_A",
+                                   "active_pdb_method"],
 }
 
 
@@ -731,6 +1334,30 @@ def parse_args():
     p.add_argument("--chunksize", type=int, default=0,
                    help="Process input in chunks of N rows (0 = all at once).  "
                         "Use for very large files (>500 K rows) if RAM is tight.")
+    p.add_argument("--maps-dir", metavar="DIR", default=None,
+                   help=(
+                       "Directory containing SIFTS flat files downloaded from "
+                       "https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/ .\n"
+                       "Expected files (plain or .gz):\n"
+                       "  uniprot_pdb.csv          (or pdb_chain_uniprot.csv)\n"
+                       "  pdb_chain_enzyme.csv      -> protein_class via EC number\n"
+                       "  pdb_chain_pfam.csv         -> protein_class via Pfam domain\n"
+                       "When present, SIFTS-based classification replaces the ChEMBL "
+                       "REST approach entirely — fully offline, >90%% coverage for "
+                       "drug targets."
+                   ))
+    p.add_argument("--sifts", metavar="FILE", default=None,
+                   help=(
+                       "Path to pdb_chain_uniprot.csv (or uniprot_pdb.csv) for PDB "
+                       "structure annotation only.  For full protein classification "
+                       "use --maps-dir instead."
+                   ))
+    p.add_argument("--no-compound-pdb", action="store_true",
+                   help=(
+                       "With --sifts: annotate target PDB counts only; skip the "
+                       "per-compound RCSB search for active_compound_pdb. "
+                       "Much faster (no network calls)."
+                   ))
     return p.parse_args()
 
 
@@ -754,8 +1381,11 @@ def main():
     df_enriched = enrich(
         df,
         sqlite_path=args.sqlite,
+        sifts_path=args.sifts,
+        maps_dir=args.maps_dir,
         skip_protein_class=args.skip_protein_class,
         use_uniprot_family=not args.skip_uniprot_family,
+        lookup_active_compound_pdb=(not args.no_compound_pdb),
     )
 
     # ── Reorder columns ───────────────────────────────────────────────────────

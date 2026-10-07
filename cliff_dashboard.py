@@ -45,6 +45,27 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, rdFMCS, rdMolAlign, rdDepictor
 from rdkit.Chem.Draw import rdMolDraw2D
 
+# ---------------------------------------------------------------------------
+# SALT / COUNTER-ION REMOVAL -- applied to every molecule parsed by RDKit
+# ---------------------------------------------------------------------------
+from rdkit.Chem.MolStandardize import rdMolStandardize as _rdMS
+_DESALT_LFC = _rdMS.LargestFragmentChooser(preferOrganic=True)
+_DESALT_UN  = _rdMS.Uncharger()
+
+
+def desalt_mol(mol):
+    """Parent molecule: largest organic fragment, neutralised.
+    Strips counter-ions / solvates (HCl, Na+, TFA, water ...). None -> None."""
+    if mol is None:
+        return None
+    try:
+        if len(Chem.GetMolFrags(mol)) > 1:
+            mol = _DESALT_LFC.choose(mol)
+        return _DESALT_UN.uncharge(mol)
+    except Exception:
+        return mol
+
+
 RDLogger.DisableLog("rdApp.*")
 warnings.filterwarnings("ignore")
 
@@ -71,7 +92,7 @@ MCS_TIMEOUT = 30    # seconds for rdFMCS (large peptides / macrocycles need > 8 
 def smi_to_mol(smi: str) -> Optional[Chem.Mol]:
     if not smi or not isinstance(smi, str):
         return None
-    return Chem.MolFromSmiles(smi.strip())
+    return desalt_mol(Chem.MolFromSmiles(smi.strip()))
 
 
 def find_mcs(mol_a: Chem.Mol, mol_b: Chem.Mol):
@@ -378,11 +399,18 @@ _HTML_TEMPLATE = """\
     </div>
   </div>
 
-  <!-- Legend -->
-  <div class="mb-2 text-muted" style="font-size:.78rem">
+  <!-- Structure legend -->
+  <div class="mb-1 text-muted" style="font-size:.78rem">
     <span class="legend-dot ld-scaffold"></span>MCS scaffold (common)&ensp;
     <span class="legend-dot ld-active"></span>Active-unique atoms (green)&ensp;
     <span class="legend-dot ld-inactive"></span>Inactive-unique atoms (red)
+  </div>
+  <!-- SALI legend -->
+  <div class="mb-2" style="font-size:.76rem">
+    <strong>SALI</strong> = |&Delta;pXC50| / (1&minus;Tanimoto)&ensp;
+    <span class="badge bg-primary">&#60;&thinsp;3 &nbsp;Biomimetic</span>&ensp;
+    <span class="badge bg-warning text-dark">3&ndash;8 &nbsp;Intermediate</span>&ensp;
+    <span class="badge bg-danger">&#62;&thinsp;8 &nbsp;Activity cliff</span>
   </div>
 
   <!-- Table -->
@@ -396,6 +424,7 @@ _HTML_TEMPLATE = """\
             <th>Active</th>
             <th>Inactive</th>
             <th data-bs-toggle="tooltip" title="log units difference in potency">|&Delta;pXC50|</th>
+            <th data-bs-toggle="tooltip" title="Structure-Activity Landscape Index = |ΔpXC50| / (1 − Tanimoto). Colour: blue &lt;3 biomimetic · orange 3–8 · red &gt;8 cliff.">SALI</th>
             <th data-bs-toggle="tooltip" title="RMSD (Angstrom) after scaffold alignment of MMFF conformers">RMSD (&Aring;)</th>
             <th>Active diff</th>
             <th>Inactive diff</th>
@@ -471,13 +500,18 @@ $(document).ready(function() {{
 
     $('#modalTitle').text('Pair #' + (rowIdx + 1) + '  \u2014  ' + d.target);
     $('#modalActiveLabel').html(
-      d.active_id + '  pXC50 = ' + d.active_pxc50
+      '<b>' + d.active_id + '</b>' +
+      '&nbsp;&nbsp;pXC50&nbsp;<b>' + d.active_pxc50 + '</b>' +
+      (d.active_value_nM ? '&nbsp;<span class="text-muted">(' + d.active_value_nM + ')</span>' : '') +
+      (d.active_std_type ? '&nbsp;<small class="text-muted">' + d.active_std_type + '</small>' : '')
     );
     $('#modalInactiveLabel').html(
-      d.inactive_id + '  ' +
+      '<b>' + d.inactive_id + '</b>&nbsp;&nbsp;' +
       (d.inactive_pxc50 !== null
-        ? 'pXC50 = ' + d.inactive_pxc50
-        : '%inh = ' + d.inactive_pct)
+        ? 'pXC50&nbsp;<b>' + d.inactive_pxc50 + '</b>' +
+          (d.inactive_value_nM ? '&nbsp;<span class="text-muted">(' + d.inactive_value_nM + ')</span>' : '') +
+          (d.inactive_std_type ? '&nbsp;<small class="text-muted">' + d.inactive_std_type + '</small>' : '')
+        : '%inh&nbsp;<b>' + d.inactive_pct + '</b>')
     );
     $('#modalActiveSVG').html(d.svg_active_lg);
     $('#modalInactiveSVG').html(d.svg_inactive_lg);
@@ -486,6 +520,7 @@ $(document).ready(function() {{
 
     var meta = [
       ['|&Delta;pXC50|', d.delta],
+      ['SALI', d.sali],
       ['RMSD (&Aring;)', d.rmsd !== null ? d.rmsd : 'n/a'],
       ['MCS atoms', d.mcs_atoms],
       ['Assay', d.assay],
@@ -514,6 +549,7 @@ _ROW_TEMPLATE = """\
             <td class="mol-thumb p-1">{svg_active}</td>
             <td class="mol-thumb p-1">{svg_inactive}</td>
             <td data-order="{delta_order}"><span class="badge {delta_badge_cls} fs-6">{delta_str}</span></td>
+            <td data-order="{sali_order}"><span class="badge {sali_badge_cls} fs-6">{sali_str}</span></td>
             <td>{rmsd_html}</td>
             <td class="diff-label text-success">{diff_active}</td>
             <td class="diff-label text-danger">{diff_inactive}</td>
@@ -526,6 +562,48 @@ _ROW_TEMPLATE = """\
 # ---------------------------------------------------------------------------
 # PROCESSING
 # ---------------------------------------------------------------------------
+
+def _fmt_nm(v) -> str:
+    """Format a raw nM value for display: µM or nM with 2 sig-figs."""
+    try:
+        f = float(v)
+        if np.isnan(f):
+            return "n/a"
+        if f >= 1000:
+            return f"{f/1000:.2f} µM"
+        return f"{f:.1f} nM"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt_sali(v) -> str:
+    try:
+        f = float(v)
+        return "n/a" if np.isnan(f) else f"{f:.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _sali_badge_cls(v) -> str:
+    """
+    Return a Bootstrap badge class that colour-codes the SALI value:
+      SALI < 3   → blue   (biomimetic — small structural change, small activity gain)
+      SALI 3–8   → orange (intermediate)
+      SALI > 8   → red    (true activity cliff)
+      n/a        → grey
+    """
+    try:
+        f = float(v)
+        if np.isnan(f):
+            return "bg-secondary"
+        if f < 3.0:
+            return "bg-primary"      # blue
+        if f < 8.0:
+            return "bg-warning text-dark"   # orange
+        return "bg-danger"           # red
+    except (TypeError, ValueError):
+        return "bg-secondary"
+
 
 def process_pair(row: pd.Series, skip_3d: bool) -> Optional[dict]:
     """
@@ -633,18 +711,38 @@ def build_dashboard(df: pd.DataFrame,
         ina_pxc_str = f"{ina_pxc:.2f}" if pd.notna(ina_pxc) else None
         ina_pct_str = f"{ina_pct:.1f}" if pd.notna(ina_pct) else "n/a"
 
-        # Active cell label
-        act_label = (f'<div style="font-size:.7rem">'
+        # Raw concentration values
+        act_nm_str = _fmt_nm(row.get("active_value_nM"))
+        ina_nm_str = _fmt_nm(row.get("inactive_value_nM"))
+
+        # SALI
+        sali_raw = row.get("sali", np.nan)
+        sali_str = _fmt_sali(sali_raw)
+        sali_ord = float(sali_raw) if pd.notna(sali_raw) else 0.0
+        sali_badge_cls = _sali_badge_cls(sali_raw)
+
+        # Measurement type
+        act_type = str(row.get("active_std_type",   ""))
+        ina_type = str(row.get("inactive_std_type", ""))
+
+        # Active cell label — show pXC50, raw concentration, measurement type
+        act_label = (f'<div style="font-size:.68rem;line-height:1.3">'
                      f'<b>{html_mod.escape(act_id)}</b><br>'
-                     f'pXC50 = <b>{act_pxc_str}</b></div>')
+                     f'pXC50&nbsp;<b>{act_pxc_str}</b><br>'
+                     f'<span class="text-muted">{html_mod.escape(act_nm_str)}'
+                     f'{" · "+html_mod.escape(act_type) if act_type else ""}</span>'
+                     f'</div>')
         # Inactive cell label
         if ina_pxc_str:
-            ina_potency = f'pXC50 = <b>{ina_pxc_str}</b>'
+            ina_potency = (f'pXC50&nbsp;<b>{ina_pxc_str}</b><br>'
+                           f'<span class="text-muted">{html_mod.escape(ina_nm_str)}'
+                           f'{" · "+html_mod.escape(ina_type) if ina_type else ""}</span>')
         else:
-            ina_potency = f'%inh = <b>{ina_pct_str}</b>'
-        ina_label = (f'<div style="font-size:.7rem">'
+            ina_potency = f'%inh&nbsp;<b>{ina_pct_str}</b>'
+        ina_label = (f'<div style="font-size:.68rem;line-height:1.3">'
                      f'<b>{html_mod.escape(ina_id)}</b><br>'
-                     f'{ina_potency}</div>')
+                     f'{ina_potency}'
+                     f'</div>')
 
         svg_active_cell   = result["svg_active_sm"]   + act_label
         svg_inactive_cell = result["svg_inactive_sm"] + ina_label
@@ -656,6 +754,9 @@ def build_dashboard(df: pd.DataFrame,
             delta_str       = delta_str,
             delta_order     = delta_ord,
             delta_badge_cls = delta_badge_cls,
+            sali_str        = sali_str,
+            sali_order      = sali_ord,
+            sali_badge_cls  = sali_badge_cls,
             rmsd_html       = rmsd_html,
             diff_active = html_mod.escape(result["diff_active"]),
             diff_inactive=html_mod.escape(result["diff_inactive"]),
@@ -683,6 +784,11 @@ def build_dashboard(df: pd.DataFrame,
             "assay":   assay,
             "conf":    conf,
             "cliff_type": cliff_type,
+            "active_value_nM":  _fmt_nm(row.get("active_value_nM")),
+            "inactive_value_nM":_fmt_nm(row.get("inactive_value_nM")),
+            "active_std_type":  str(row.get("active_std_type",   "")),
+            "inactive_std_type":str(row.get("inactive_std_type", "")),
+            "sali":   _fmt_sali(row.get("sali")),
         })
 
     # Summary stats
