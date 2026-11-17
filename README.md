@@ -935,4 +935,3 @@ python transformation_classifier.py neutral_211_pairs_enriched.csv tx_211
 python cliff_dashboard.py --input all_cliffs_neutral_enriched.csv --cliff-type XC50 --output dashboard.html
 ```
 
-> TODO (authors): replace step 1 with the exact command line of the submitted run (including any neutralisation/salt options) before release.
