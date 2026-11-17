@@ -1,6 +1,6 @@
 # Activity Cliff Scanner
 
-A three-script pipeline for detecting, enriching, and visualising **activity cliffs** in ChEMBL — structurally similar compound pairs with large potency differences — using ECFP4 fingerprints, RDKit, and the ChEMBL 37 SQLite database.
+A pipeline of three core scripts (plus an optional transformation classifier) for detecting, enriching, and visualising **activity cliffs** in ChEMBL — structurally similar compound pairs with large potency differences — using ECFP4 fingerprints, RDKit, and the ChEMBL 37 SQLite database.
 
 Final output is an helpful dashboard ![dashboard](https://github.com/agiani99/Activity_Cliff_scanner/blob/main/Screenshot.png).
 
@@ -18,6 +18,8 @@ Final output is an helpful dashboard ![dashboard](https://github.com/agiani99/Ac
 8. [Recommended workflow](#recommended-workflow)
 9. [Output column reference](#output-column-reference)
 10. [Scientific notes](#scientific-notes)
+11. [Script 4 — `transformation_classifier.py`](#script-4--transformation_classifierpy)
+12. [Reproducing the paper numbers](#reproducing-the-paper-numbers)
 
 ---
 
@@ -51,6 +53,8 @@ activity_cliff_scanner.py   ──►  all_cliffs.csv
                    cliff_enrich.py ◄──┘──► all_cliffs_enriched.csv
                                                       │
                           cliff_dashboard.py ◄────────┘──► dashboard.html
+                                                      │
+              transformation_classifier.py ◄──────────┘──► *_table.csv, *_pairs.csv
 ```
 
 ---
@@ -129,11 +133,19 @@ python activity_cliff_scanner.py \
     --xc50-only \
     --output all_cliffs_strict.csv
 
-# Middle ground: same assay-type (B↔B or F↔F)
+# Middle ground: same assay-type (B↔B or F↔F) — affects pct_fallback cliffs only
 python activity_cliff_scanner.py \
     --sqlite "C:/path/to/chembl_37_sqlite" \
     --same-assay-type \
     --output all_cliffs_typed.csv
+
+# Threshold sensitivity: relax similarity to 0.90 (XC50 same-assay pairs only).
+# WARNING: very memory-hungry on the full proteome (~27 GB RAM per process in our run).
+# Run ONE process at a time and never point two runs at the same --output file.
+python activity_cliff_scanner.py \
+    --sqlite "C:/path/to/chembl_37_sqlite" \
+    --xc50-only --tanimoto 0.90 --resume \
+    --output cliffs_tc090_xc50.csv
 
 # Resume an interrupted run
 python activity_cliff_scanner.py \
@@ -175,6 +187,10 @@ python activity_cliff_scanner.py --demo
 | *(none)*            | None — any cross-assay pair | Most (268 K+ in full proteome run)    |
 | `--same-assay-type` | B↔B or F↔F only            | Subset — removes cross-biology pairs |
 | `--xc50-only`       | Same assay, XC50 only        | Fewest — highest confidence          |
+
+> **Note.** `XC50` cliffs always require the same `assay_chembl_id`, whatever flags are set.
+> `--same-assay-type` therefore only constrains the `pct_fallback` cliffs; on a pure-XC50 result
+> (as in the paper) it has no effect. Use `--xc50-only` to drop `pct_fallback` cliffs altogether.
 
 ### Biomimetics vs activity cliffs — pair-reduction modes
 
@@ -429,13 +445,24 @@ New columns visible in the table and detail modal when present in the input CSV:
 - **Raw XC50** — original concentration (nM or µM) shown under pXC50 in each molecule cell
 - **Measurement type** — IC50 / EC50 / Ki / Kd shown as small label
 
+### RMSD protocol
+
+For each pair the dashboard computes a ligand-only 3D comparison:
+
+1. Maximum common substructure (MCS, `rdFMCS`) between the two molecules gives the atom correspondence.
+2. One conformer per molecule: RDKit ETKDGv3 embedding (random seed 42), MMFF minimisation (500 iterations).
+3. Rigid alignment (`AlignMol` with the MCS atom map) on the MCS heavy atoms.
+4. RMSD over the **MCS atoms only** (atoms outside the MCS are not counted). If the atom-map alignment fails, `GetBestRMS` is used as fallback.
+
 ### RMSD interpretation
+
+RMSD here describes the **geometry of isolated, individually minimised ligands**. It is *not* evidence of a binding mode or of an electronic/conformational mechanism; use experimental structures (e.g. PDB co-crystals) for that.
 
 | RMSD (Å) | Interpretation                                                                                           |
 | --------- | -------------------------------------------------------------------------------------------------------- |
-| < 0.5     | Scaffold rigid; cliff is likely**electronic** (changed atom alters charge, H-bond, polarisability) |
-| 0.5–1.5  | Mixed — electronic + minor conformational perturbation                                                  |
-| > 1.5     | Structural change**perturbs the preferred conformation** — possible binding-mode change           |
+| < 0.5     | **Geometrically conserved** — the MCS core keeps essentially the same low-energy shape in both molecules |
+| 0.5–1.5  | Intermediate geometric perturbation                                                                      |
+| > 1.5     | **Geometrically divergent** — the change perturbs the preferred conformation (possible, not proven, binding-mode change) |
 
 ---
 
@@ -643,6 +670,19 @@ python cliff_dashboard.py \
 
 At this threshold, pairs typically differ by a **single atom or small functional group** (F→Cl, H→CH₃, CH₂ insertion, ring-size change). This makes structural differences unambiguous and directly interpretable. Lowering to 0.85 admits scaffold hops where the activity difference may not be attributable to one specific structural change.
 
+**Sensitivity (ChEMBL 37, `--xc50-only`, assay confidence ≥ 8, |ΔpXC50| ≥ 2.0):**
+
+| ECFP4 Tanimoto | Pairs | Targets | Pairs with \|ΔpXC50\| ≥ 3.0 |
+| -------------- | ----- | ------- | -------------------------- |
+| ≥ 0.95        | 211   | 140     | 34                         |
+| ≥ 0.90        | 1,052 | 440     | 139                        |
+
+The ≥ 0.95 subset of the 0.90 scan reproduces the 211 pairs exactly (841 additional pairs across 378 targets fall in the 0.90–0.95 band).
+
+### Why ECFP4 (radius 2, 2048 bits)?
+
+ECFP4 is the de-facto standard in activity-cliff work, so thresholds and counts are comparable with the literature. It encodes circular atom environments, so single-atom changes are visible, and the 2048-bit folded form is fast enough for all-vs-all comparison within each target. MACCS keys or atom-pair fingerprints would change the similarity scale and are not used here.
+
 ### Why confidence score ≥ 8?
 
 Scores 8 and 9 indicate **direct binding/functional measurement on a single, defined protein target** (not inferred from cellular readouts or homology). Lower scores introduce uncertainty about which molecular target is responsible for the observed activity.
@@ -842,3 +882,57 @@ python activity_cliff_scanner.py \
 | Low delta, no flags (delta=0.5)     | Up to 15 (star)       | Redundant — same active repeated       |
 | `--chain-only` (delta=0.5)        | ≤ 5 (ladder)         | Clean step-by-step SAR                  |
 | `--best-partner-only` (delta=0.5) | ≤ 6 (one per active) | Collapsed star — best partner retained |
+
+---
+
+## Script 4 — `transformation_classifier.py`
+
+Assigns each cliff pair to one structural-transformation category (the classification behind Table 1 / Fig. 5 of the paper). Categories are **mutually exclusive**: every pair gets exactly one.
+
+### Method
+
+For each pair, from the **active** compound's perspective:
+
+1. MCS of the two molecules (`cliff_dashboard.find_mcs`); `dn` = (atoms outside MCS in active) − (atoms outside MCS in inactive).
+2. Rules applied in a fixed priority order; the first that matches wins:
+
+| Priority | Category                      | Rule                                                        |
+| -------- | ----------------------------- | ----------------------------------------------------------- |
+| 1        | Ring gain in active           | active has more rings than inactive                         |
+| 2        | Stereochemistry change        | identical flat SMILES, different isomeric SMILES            |
+| 3        | Methyl addition / removal     | `dn = +1` / `−1` and the single extra atom is a carbon      |
+| 4        | Larger / smaller substituent  | any other `dn > 0` / `dn < 0`                               |
+| 5        | Ring loss in active           | `dn < −1` with fewer rings in active (kept apart from 4)    |
+| 6        | Heteroatom / other change     | `dn = 0` (e.g. F→Cl, C→N swap)                              |
+
+Because of the priority order, a pair that could satisfy several rules (e.g. gains a ring *and* a methyl) is counted once, under the highest-priority rule.
+
+### Usage
+
+```bash
+# Run from the repository root (cliff_dashboard.py must be importable)
+python transformation_classifier.py neutral_211_pairs_enriched.csv tx_211
+```
+
+Outputs: `tx_211_table.csv` (n, %, mean/median ΔpXC50, mean pXC50 of active/inactive per category) and `tx_211_pairs.csv` (input pairs plus `dn`, ring counts and the assigned category in column `tx`).
+
+Input: a CSV with `active_smiles`, `inactive_smiles`, `active_pXC50`, `inactive_pXC50`, `delta_pXC50`.
+
+> **Caveat.** The categories are rule-based approximations of the structural change (not a formal matched-molecular-pair fragmentation), and `dn` counts heavy atoms only. Treat them as descriptive.
+
+---
+
+## Reproducing the paper numbers
+
+```bash
+# 1. Scan: XC50, same assay, ECFP4 Tc >= 0.95, |dpXC50| >= 2, confidence >= 8 -> 211 pairs / 140 targets
+python activity_cliff_scanner.py --sqlite "C:/path/to/chembl_37_sqlite" --xc50-only --output all_cliffs_neutral.csv
+# 2. Enrich
+python cliff_enrich.py --input all_cliffs_neutral.csv --sqlite "C:/path/to/chembl_37_sqlite" --maps-dir ".\MAPS" --output all_cliffs_neutral_enriched.csv
+# 3. Transformation table (Table 1)
+python transformation_classifier.py neutral_211_pairs_enriched.csv tx_211
+# 4. Dashboard with 3D RMSD
+python cliff_dashboard.py --input all_cliffs_neutral_enriched.csv --cliff-type XC50 --output dashboard.html
+```
+
+> TODO (authors): replace step 1 with the exact command line of the submitted run (including any neutralisation/salt options) before release.
