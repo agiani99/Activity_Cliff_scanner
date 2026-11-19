@@ -1358,7 +1358,33 @@ def parse_args():
                        "per-compound RCSB search for active_compound_pdb. "
                        "Much faster (no network calls)."
                    ))
+    p.add_argument("--classify-transformations", action="store_true",
+                   help=(
+                       "Add column 'transformation_type' (rule-based structural change from the "
+                       "active compound's perspective; see transformation_classifier.py). "
+                       "Needs an MCS per pair, so it is slow: applied to XC50 rows only unless "
+                       "--classify-all is given."
+                   ))
+    p.add_argument("--classify-all", action="store_true",
+                   help="With --classify-transformations: classify ALL rows (very slow on "
+                        "full-proteome files with hundreds of thousands of pct_fallback pairs).")
     return p.parse_args()
+
+
+def add_transformation_column(df: pd.DataFrame, all_rows: bool = False) -> pd.DataFrame:
+    """Annotate pairs with a mutually exclusive structural-transformation label."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from transformation_classifier import classify_pairs
+    mask = pd.Series(True, index=df.index)
+    if not all_rows and "cliff_type" in df.columns:
+        mask = df["cliff_type"].astype(str).eq("XC50")
+    sub = df[mask]
+    logger.info(f"\nClassifying transformations for {len(sub):,} pairs (MCS-based, slow)...")
+    df["transformation_type"] = ""
+    if len(sub):
+        labels, _ = classify_pairs(sub)
+        df.loc[sub.index, "transformation_type"] = labels
+    return df
 
 
 def main():
@@ -1387,6 +1413,9 @@ def main():
         use_uniprot_family=not args.skip_uniprot_family,
         lookup_active_compound_pdb=(not args.no_compound_pdb),
     )
+
+    if args.classify_transformations:
+        df_enriched = add_transformation_column(df_enriched, all_rows=args.classify_all)
 
     # ── Reorder columns ───────────────────────────────────────────────────────
     df_enriched = reorder_columns(df_enriched)
