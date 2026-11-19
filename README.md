@@ -887,38 +887,39 @@ python activity_cliff_scanner.py \
 
 ## Script 4 — `transformation_classifier.py`
 
-Assigns each cliff pair to one structural-transformation category (the classification behind Table 1 / Fig. 5 of the paper). Categories are **mutually exclusive**: every pair gets exactly one.
+Assigns each cliff pair **one** structural-transformation label (the classification behind Table 1 of the paper). Labels are mutually exclusive and always describe the **active** compound relative to the inactive one. It is a module imported by `cliff_enrich.py` and can also be run stand-alone.
 
 ### Method
 
-For each pair, from the **active** compound's perspective:
-
-1. MCS of the two molecules (`cliff_dashboard.find_mcs`); `dn` = (atoms outside MCS in active) − (atoms outside MCS in inactive).
+1. MCS of the two molecules (`cliff_dashboard.find_mcs`). "Diff atoms" are the atoms outside the MCS; `dn` = (diff atoms in active) − (diff atoms in inactive).
 2. Rules applied in a fixed priority order; the first that matches wins:
 
-| Priority | Category                      | Rule                                                        |
-| -------- | ----------------------------- | ----------------------------------------------------------- |
-| 1        | Ring gain in active           | active has more rings than inactive                         |
-| 2        | Stereochemistry change        | identical flat SMILES, different isomeric SMILES            |
-| 3        | Methyl addition / removal     | `dn = +1` / `−1` and the single extra atom is a carbon      |
-| 4        | Larger / smaller substituent  | any other `dn > 0` / `dn < 0`                               |
-| 5        | Ring loss in active           | `dn < −1` with fewer rings in active (kept apart from 4)    |
-| 6        | Heteroatom / other change     | `dn = 0` (e.g. F→Cl, C→N swap)                              |
+| Priority | Condition                                         | Label(s)                                                                                          |
+| -------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 1        | number of rings differs                           | Ring gain / Ring loss in active                                                                   |
+| 2        | identical flat SMILES, different isomeric SMILES  | Stereochemistry change                                                                            |
+| 3        | `dn = 0`                                          | Halogen exchange · Heteroatom swap · Other same-size change                                       |
+| 4        | `\|dn\| = 1`                                      | Methyl addition/removal (terminal carbon, partner has no diff atoms) · Ring expansion/contraction (ring atoms outside the MCS in both) · Chain extension/shortening · Halogen gain/loss · Heteroatom gain/loss |
+| 5        | `\|dn\| ≥ 2`                                      | Halogen gain/loss (only halogens differ) · Larger / Smaller substituent in active                 |
+| —        | MCS failed                                        | Unclassified (no MCS)                                                                             |
 
-Because of the priority order, a pair that could satisfy several rules (e.g. gains a ring *and* a methyl) is counted once, under the highest-priority rule.
+> **Important.** An extra *ring* CH₂ (e.g. pyrrolidine vs piperidine) is a ring-size change, **not** a methyl change. Earlier versions of this script counted any single extra carbon as "methyl"; on the 211 paper pairs that mislabelled about 120 ring-size changes. Categories are descriptive, MCS-based approximations (heavy atoms only), not a formal matched-molecular-pair fragmentation.
 
 ### Usage
 
 ```bash
-# Run from the repository root (cliff_dashboard.py must be importable)
+# 1) as an annotation column in the enrichment step (XC50 rows only; slow, needs an MCS per pair)
+python cliff_enrich.py --input all_cliffs_neutral.csv --sqlite "C:/path/to/chembl_37_sqlite" \
+    --maps-dir ".\\MAPS" --classify-transformations --output all_cliffs_neutral_enriched.csv
+#    add --classify-all to label every row (very slow on full-proteome files)
+
+# 2) stand-alone on a pairs CSV (needs cliff_dashboard.py importable; run from the repository root)
 python transformation_classifier.py neutral_211_pairs_enriched.csv tx_211
 ```
 
-Outputs: `tx_211_table.csv` (n, %, mean/median ΔpXC50, mean pXC50 of active/inactive per category) and `tx_211_pairs.csv` (input pairs plus `dn`, ring counts and the assigned category in column `tx`).
+Outputs: new column `transformation_type` (option 1), or `tx_211_table.csv` (n, %, mean/median |ΔpXC50| per label) and `tx_211_pairs.csv` (pairs + label + the features used) (option 2). Input needs `active_smiles`, `inactive_smiles`, `delta_pXC50`.
 
-Input: a CSV with `active_smiles`, `inactive_smiles`, `active_pXC50`, `inactive_pXC50`, `delta_pXC50`.
-
-> **Caveat.** The categories are rule-based approximations of the structural change (not a formal matched-molecular-pair fragmentation), and `dn` counts heavy atoms only. Treat them as descriptive.
+Result on the 211 paper pairs: ring contraction 62, ring expansion 57, larger substituent 25, smaller substituent 23, ring gain 14, other same-size 9, ring loss 7, chain extension/shortening 5/4, methyl removal/addition 2/1, heteroatom swap 1, halogen loss 1.
 
 ---
 
@@ -935,3 +936,4 @@ python transformation_classifier.py neutral_211_pairs_enriched.csv tx_211
 python cliff_dashboard.py --input all_cliffs_neutral_enriched.csv --cliff-type XC50 --output dashboard.html
 ```
 
+> TODO (authors): replace step 1 with the exact command line of the submitted run (including any neutralisation/salt options) before release.
